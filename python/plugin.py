@@ -22,14 +22,14 @@ try:
     from .statistics import RollingStatistics
     from .tcp_server import TcpBroadcastServer, TcpControlServer, TcpTelemetryServer
 except ImportError:
-    from plugins.serial_adapter.ring_buffer import (
+    from ring_buffer import (  # type: ignore[no-rebase]
         DEFAULT_BUFFER_SIZE,
         DEFAULT_FRAME_DELIMITER,
         DEFAULT_MAX_FRAMES,
         RingBuffer,
     )
-    from plugins.serial_adapter.statistics import RollingStatistics
-    from plugins.serial_adapter.tcp_server import (
+    from statistics import RollingStatistics  # type: ignore[no-rebase]
+    from tcp_server import (  # type: ignore[no-rebase]
         TcpBroadcastServer,
         TcpControlServer,
         TcpTelemetryServer,

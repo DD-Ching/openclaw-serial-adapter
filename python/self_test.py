@@ -8,13 +8,9 @@ import time
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 try:
-    from plugins.serial_adapter.plugin import RingBuffer, SerialAdapter
+    from .plugin import RingBuffer, SerialAdapter
 except ImportError:
-    import os
-    import sys
-
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
-    from plugins.serial_adapter.plugin import RingBuffer, SerialAdapter
+    from plugin import RingBuffer, SerialAdapter  # type: ignore[no-rebase]
 
 
 class _FakeSerial:

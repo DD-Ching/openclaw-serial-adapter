@@ -1,0 +1,24 @@
+{
+  "id": "serial-adapter",
+  "name": "Serial Adapter",
+  "description": "Serial device telemetry adapter with ring-buffer frame assembly and split TCP channels",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "pythonPath": { "type": "string", "default": "python3" },
+      "serialPort": { "type": "string" },
+      "baudrate": { "type": "number", "default": 115200 },
+      "telemetryPort": { "type": "number", "default": 9000 },
+      "controlPort": { "type": "number", "default": 9001 },
+      "host": { "type": "string", "default": "127.0.0.1" },
+      "unsafePassthrough": { "type": "boolean", "default": false },
+      "allowedCommands": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": ["motor_pwm", "target_velocity"]
+      },
+      "maxControlRate": { "type": "number", "default": 50 }
+    },
+    "required": ["serialPort"]
+  }
+}

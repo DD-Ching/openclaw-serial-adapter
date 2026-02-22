@@ -1,0 +1,27 @@
+{
+  "name": "@openclaw/serial-adapter",
+  "version": "0.3.0",
+  "description": "Serial device telemetry adapter plugin for OpenClaw",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "self-test": "python3 -m python.self_test"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.js"]
+  },
+  "peerDependencies": {
+    "openclaw": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  },
+  "files": [
+    "dist/",
+    "python/",
+    "openclaw.plugin.json"
+  ],
+  "license": "MIT"
+}

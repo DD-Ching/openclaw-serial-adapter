@@ -1,10 +1,12 @@
-﻿# OpenClaw Serial Adapter
+# OpenClaw Serial Adapter
 
 Universal telemetry adapter plugin for OpenClaw, supporting serial device ingestion with buffered frame parsing and split TCP interfaces for telemetry and control.
 
 ## Overview
 
-`openclaw-serial-adapter` reads line-delimited serial telemetry, reconstructs fragmented frames with a ring buffer, and exposes data to local clients and automation tools.
+`@openclaw/serial-adapter` reads line-delimited serial telemetry, reconstructs fragmented frames with a ring buffer, and exposes data to local clients and automation tools.
+
+The TypeScript plugin spawns a Python subprocess that handles the serial I/O and TCP servers, then bridges telemetry and control through OpenClaw tool registrations.
 
 ## Features
 
@@ -18,54 +20,99 @@ Universal telemetry adapter plugin for OpenClaw, supporting serial device ingest
 
 ## Installation
 
-1. Clone repository:
-
 ```bash
-git clone https://github.com/DD-Ching/openclaw-serial-adapter
-cd openclaw-serial-adapter
+openclaw plugins install @openclaw/serial-adapter
 ```
 
-2. Ensure Python 3.10+ is available.
+### Prerequisites
 
-3. Run plugin self-test:
+- Python 3.10+ with `pyserial` installed on the host machine
+- Node.js 18+
 
-```bash
-python -m plugins.serial_adapter.self_test
+## Plugin Configuration
+
+Add to your OpenClaw project config:
+
+```json
+{
+  "plugins": {
+    "serial-adapter": {
+      "serialPort": "/dev/ttyUSB0",
+      "baudrate": 115200,
+      "telemetryPort": 9000,
+      "controlPort": 9001
+    }
+  }
+}
 ```
 
-## Usage
+### Config Options
 
-### Monitor Telemetry
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `serialPort` | string | *required* | Serial device path |
+| `baudrate` | number | `115200` | Serial baud rate |
+| `telemetryPort` | number | `9000` | TCP telemetry broadcast port |
+| `controlPort` | number | `9001` | TCP control command port |
+| `host` | string | `127.0.0.1` | TCP bind host |
+| `pythonPath` | string | `python3` | Python interpreter path |
+| `unsafePassthrough` | boolean | `false` | Allow all control keys |
+| `allowedCommands` | string[] | `["motor_pwm", "target_velocity"]` | Command allowlist |
+| `maxControlRate` | number | `50` | Max control commands per second |
+
+## Registered Tools
+
+| Tool | Description |
+|---|---|
+| `serial_connect` | Connect to serial device and start adapter |
+| `serial_poll` | Read available telemetry frames |
+| `serial_send` | Send a control command to serial device |
+| `serial_status` | Get adapter runtime status |
+
+## Development
+
+### Run self-test
 
 ```bash
-python plugins/serial_adapter/examples/tcp_monitor.py --host 127.0.0.1 --port 9000
+python -m python.self_test
 ```
 
-### Send Control Command
+### Monitor telemetry (standalone)
 
 ```bash
-python plugins/serial_adapter/examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
+python examples/tcp_monitor.py --host 127.0.0.1 --port 9000
 ```
 
-## Configuration Options
+### Send control command (standalone)
 
-`SerialAdapter(...)` supports:
+```bash
+python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
+```
 
-- `port`: serial device path
-- `baudrate`: serial baud rate
-- `buffer_size`: ring buffer size in bytes (default `512*1024`)
-- `frame_delimiter`: frame delimiter bytes/string (default newline)
-- `max_frames`: in-memory frame history limit (default `10`)
-- `tcp_host`: TCP bind host (default `127.0.0.1`)
-- `telemetry_port`: telemetry TCP port (default `9000`)
-- `control_port`: control TCP port (default `9001`)
-- `enable_tcp`: enable/disable TCP servers
-- `unsafe_passthrough`: allow all control keys when `True` (default `False`)
-- `allowed_commands`: allowlist when passthrough is disabled
-- `max_control_rate`: max control commands per second (default `50`)
+### Build TypeScript
+
+```bash
+npm install
+npm run build
+```
+
+## Architecture
+
+```
+OpenClaw Gateway
+  └─ serial-adapter plugin (TypeScript)
+       ├─ register() registers tools + service
+       ├─ service.start() → spawn python3 subprocess
+       │    └─ Python SerialAdapter
+       │         ├─ Serial port reader thread
+       │         ├─ TCP telemetry server :9000
+       │         └─ TCP control server :9001
+       ├─ serial_poll tool → TCP client reads :9000
+       ├─ serial_send tool → TCP client writes :9001
+       └─ service.stop() → SIGTERM subprocess
+```
 
 ## Additional Documentation
 
 - Protocol: `docs/protocol.md`
 - Architecture: `docs/architecture.md`
-- Plugin internals and examples: `plugins/serial_adapter/README.md`
