@@ -16,8 +16,25 @@ import threading
 
 from .plugin import SerialAdapter
 
+_MISSING_DEPS_MSG = """\
+ERROR: Required Python package 'pyserial' is not installed.
+
+Install it with one of:
+    pip install pyserial
+    uv pip install pyserial
+"""
+
+
+def _check_dependencies() -> None:
+    try:
+        import serial  # noqa: F401
+    except ImportError:
+        print(_MISSING_DEPS_MSG, file=sys.stderr)
+        sys.exit(1)
+
 
 def main() -> None:
+    _check_dependencies()
     parser = argparse.ArgumentParser(description="OpenClaw Serial Adapter subprocess")
     parser.add_argument("--port", required=True, help="Serial device path")
     parser.add_argument("--baudrate", type=int, default=115200)
