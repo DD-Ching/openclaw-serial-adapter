@@ -4,6 +4,11 @@
       "name": "example_kalman",
       "type": "filter",
       "path": "plugins/controller_base/example_kalman.py"
+    },
+    {
+      "name": "example_plugin",
+      "entry": "plugins.example_plugin.plugin:ExamplePlugin",
+      "version": "0.1"
     }
   ]
 }
