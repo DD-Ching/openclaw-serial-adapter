@@ -1,9 +1,26 @@
 import { spawn, ChildProcess } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
 import type { PluginConfig, ReadyMessage } from "./types.js";
 
 const READY_TIMEOUT_MS = 10_000;
+
+/** Package root — one level up from dist/src/. */
+const PKG_ROOT = resolve(import.meta.dirname, "..");
+
+/**
+ * Resolve the Python interpreter to use.
+ * Priority: explicit config > .venv created by postinstall > system python3.
+ */
+function resolvePython(config: PluginConfig): string {
+  if (config.pythonPath) return config.pythonPath;
+
+  const venvPython = resolve(PKG_ROOT, ".venv", "bin", "python");
+  if (existsSync(venvPython)) return venvPython;
+
+  return "python3";
+}
 
 export class PythonLauncher {
   private process: ChildProcess | null = null;
@@ -13,7 +30,7 @@ export class PythonLauncher {
 
   constructor(config: PluginConfig) {
     this.config = config;
-    this.pythonPath = config.pythonPath ?? "python3";
+    this.pythonPath = resolvePython(config);
   }
 
   async start(): Promise<ReadyMessage> {
@@ -23,7 +40,7 @@ export class PythonLauncher {
 
     // Run with cwd at the package root so `python -m python` resolves
     // the python/ package directory correctly.
-    const cwd = resolve(import.meta.dirname, "..");
+    const cwd = PKG_ROOT;
 
     const args = [
       "-m",

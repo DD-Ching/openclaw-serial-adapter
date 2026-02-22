@@ -8,6 +8,7 @@
   "scripts": {
     "build": "tsc",
     "self-test": "uv run pytest tests/ -x",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepare": "husky"
   },
   "openclaw": {
@@ -25,7 +26,10 @@
   "files": [
     "dist/",
     "python/",
-    "openclaw.plugin.json"
+    "scripts/",
+    "openclaw.plugin.json",
+    "pyproject.toml",
+    "uv.lock"
   ],
   "license": "MIT"
 }
