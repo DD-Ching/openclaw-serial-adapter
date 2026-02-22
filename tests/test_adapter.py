@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import time
 from typing import Any, Dict, List
@@ -351,3 +352,169 @@ def test_combined_tcp_port_compat():
             client.close()
     finally:
         adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Validation & edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_same_telemetry_control_port_raises():
+    port = find_free_port()
+    with pytest.raises(ValueError, match="differ"):
+        SerialAdapter(
+            "mock", 9600, telemetry_port=port, control_port=port, enable_tcp=True
+        )
+
+
+def test_register_callback_non_callable_raises():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    with pytest.raises(TypeError, match="callable"):
+        adapter.register_callback("not a function")  # type: ignore[arg-type]
+
+
+def test_get_latest_frame_none_initially(adapter_with_tcp: SerialAdapter):
+    assert adapter_with_tcp.get_latest_frame() is None
+
+
+def test_get_last_n_frames_zero(
+    adapter_with_tcp: SerialAdapter, fake_serial: FakeSerial
+):
+    fake_serial.feed(b'{"value":1}|')
+    assert wait_for(lambda: adapter_with_tcp.get_latest_frame() is not None)
+    assert adapter_with_tcp.get_last_n_frames(0) == []
+
+
+def test_write_non_dict_raises():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="dict"):
+        adapter.write("not a dict")  # type: ignore[arg-type]
+
+
+def test_write_sends_json_to_serial():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter.write({"motor_pwm": 100})
+    assert len(fake.writes) == 1
+    payload = fake.writes[0]
+    assert b"motor_pwm" in payload
+    assert b"100" in payload
+
+
+def test_write_without_serial_raises():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    with pytest.raises(RuntimeError, match="not connected"):
+        adapter.write({"cmd": "test"})
+
+
+# ---------------------------------------------------------------------------
+# No-TCP mode
+# ---------------------------------------------------------------------------
+
+
+def test_no_tcp_endpoints_none():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    assert adapter.get_tcp_endpoint() is None
+    assert adapter.get_control_endpoint() is None
+
+
+def test_no_tcp_poll_works():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False, frame_delimiter="|")
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter.start()
+    try:
+        fake.feed(b'{"value":42}|')
+        assert wait_for(lambda: adapter.get_latest_frame() is not None)
+        frame = adapter.poll()
+        assert frame is not None
+        assert frame["parsed"]["value"] == 42
+    finally:
+        adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Disconnect cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_disconnect_clears_state(
+    adapter_with_tcp: SerialAdapter, fake_serial: FakeSerial
+):
+    fake_serial.feed(b'{"value":10}|')
+    assert wait_for(lambda: adapter_with_tcp.get_latest_frame() is not None)
+    adapter_with_tcp.disconnect()
+    assert adapter_with_tcp.get_latest_frame() is None
+    assert adapter_with_tcp.get_last_n_frames(10) == []
+
+
+# ---------------------------------------------------------------------------
+# Multiple callbacks
+# ---------------------------------------------------------------------------
+
+
+def test_multiple_callbacks(
+    adapter_with_tcp: SerialAdapter, fake_serial: FakeSerial
+):
+    results_a: List[Dict[str, Any]] = []
+    results_b: List[Dict[str, Any]] = []
+    adapter_with_tcp.register_callback(lambda f: results_a.append(f))
+    adapter_with_tcp.register_callback(lambda f: results_b.append(f))
+
+    fake_serial.feed(b'{"value":1}|')
+    assert wait_for(lambda: len(results_a) >= 1 and len(results_b) >= 1)
+
+
+# ---------------------------------------------------------------------------
+# Control command allow/deny
+# ---------------------------------------------------------------------------
+
+
+def test_allowed_commands_custom_list():
+    adapter = SerialAdapter(
+        "mock",
+        9600,
+        enable_tcp=False,
+        allowed_commands=["set_speed"],
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    # Allowed
+    adapter._handle_control_command({"set_speed": 100})  # type: ignore[attr-defined]
+    assert len(fake.writes) == 1
+
+    # Denied (not in custom list)
+    adapter._handle_control_command({"motor_pwm": 50})  # type: ignore[attr-defined]
+    assert len(fake.writes) == 1  # no new write
+
+
+def test_unsafe_passthrough_allows_all():
+    adapter = SerialAdapter(
+        "mock", 9600, enable_tcp=False, unsafe_passthrough=True
+    )
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    adapter._handle_control_command({"anything": 1})  # type: ignore[attr-defined]
+    adapter._handle_control_command({"shutdown": 1})  # type: ignore[attr-defined]
+    assert len(fake.writes) == 2
+
+
+# ---------------------------------------------------------------------------
+# Status counters
+# ---------------------------------------------------------------------------
+
+
+def test_status_initial_values():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False)
+    status = adapter.get_status()
+    assert status["rx_rate"] == 0.0
+    assert status["tx_rate"] == 0.0
+    assert status["connected_clients"] == 0
+    assert status["control_commands_accepted"] == 0
+    assert status["control_commands_rejected"] == 0
+    assert 0.0 <= status["ring_buffer_usage_ratio"] <= 1.0
