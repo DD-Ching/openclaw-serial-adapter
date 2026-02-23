@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenClaw TS Bridge Pipeline Control Command",
+  "type": "object",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "enable_block" },
+        "block_name": { "type": "string", "minLength": 1 }
+      },
+      "required": ["cmd", "block_name"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "disable_block" },
+        "block_name": { "type": "string", "minLength": 1 }
+      },
+      "required": ["cmd", "block_name"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_param" },
+        "block_name": { "type": "string", "minLength": 1 },
+        "key": { "type": "string", "minLength": 1 },
+        "value": {}
+      },
+      "required": ["cmd", "block_name", "key", "value"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_keys" },
+        "keys": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "minItems": 1
+        }
+      },
+      "required": ["cmd", "keys"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_window" },
+        "window": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["cmd", "window"],
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "properties": {
+        "cmd": { "const": "set_interval_ms" },
+        "interval_ms": { "type": "integer", "minimum": 100 }
+      },
+      "required": ["cmd", "interval_ms"],
+      "additionalProperties": false
+    }
+  ]
+}

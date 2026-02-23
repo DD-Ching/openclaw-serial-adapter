@@ -1,0 +1,33 @@
+{
+  "telemetry": {
+    "host": "127.0.0.1",
+    "port": 9000
+  },
+  "summary": {
+    "keys": ["velocity", "pos", "value"],
+    "window": 64,
+    "interval_ms": 1000
+  },
+  "blocks": {
+    "summarizer": {
+      "enabled": true,
+      "config": {
+        "keys": ["velocity", "pos", "value"],
+        "window": 64,
+        "outputKey": "summary"
+      }
+    },
+    "pid": {
+      "enabled": false,
+      "config": {
+        "measurementKey": "velocity",
+        "setpoint": 0,
+        "kp": 1,
+        "ki": 0,
+        "kd": 0,
+        "dtSeconds": 0.05,
+        "outputKey": "control.target_pwm"
+      }
+    }
+  }
+}
