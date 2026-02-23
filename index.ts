@@ -57,7 +57,7 @@ const plugin = {
   description:
     "Serial device telemetry adapter with ring-buffer frame assembly and split TCP channels",
 
-  async register(api: OpenClawPluginApi) {
+  register(api: OpenClawPluginApi) {
     const config = (api.pluginConfig ?? {}) as unknown as PluginConfig;
     log = api.logger;
 
@@ -65,6 +65,12 @@ const plugin = {
     api.registerService({
       id: "serial-adapter",
       async start() {
+        if (!config.serialPort) {
+          log.info(
+            "serialPort is not configured. Service will stay idle until serial_connect is called."
+          );
+          return;
+        }
         await connectAdapter(config);
       },
       async stop() {
@@ -94,6 +100,12 @@ const plugin = {
           serialPort: params.port ?? config.serialPort,
           baudrate: params.baudrate ?? config.baudrate,
         };
+        if (!dynamicConfig.serialPort) {
+          return jsonResult({
+            error:
+              "No serial port configured. Set plugins.entries.serial-adapter.config.serialPort or pass port.",
+          });
+        }
         return jsonResult(await connectAdapter(dynamicConfig));
       },
     });
@@ -135,9 +147,7 @@ const plugin = {
             error: "Not connected. Call serial_connect first.",
           });
         }
-        controlClient.sendCommand(
-          params.command as Record<string, unknown>
-        );
+        controlClient.sendCommand(params.command as Record<string, unknown>);
         return jsonResult({ status: "sent" });
       },
     });

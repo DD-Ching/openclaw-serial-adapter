@@ -6,7 +6,7 @@ Universal telemetry adapter plugin for OpenClaw, supporting serial device ingest
 
 `@openclaw/serial-adapter` reads line-delimited serial telemetry, reconstructs fragmented frames with a ring buffer, and exposes data to local clients and automation tools.
 
-The TypeScript plugin spawns a Python subprocess that handles the serial I/O and TCP servers, then bridges telemetry and control through OpenClaw tool registrations.
+The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP servers, then bridges telemetry and control through OpenClaw tool registrations.
 
 ## Features
 
@@ -20,27 +20,65 @@ The TypeScript plugin spawns a Python subprocess that handles the serial I/O and
 
 ## Installation
 
+### Option A (Windows recommended): Manual install
+
+Use this path when `openclaw plugins install` fails on Windows with spawn-related errors (for example `spawn EINVAL` or `Failed to start CLI`).
+
+```powershell
+git clone https://github.com/DD-Ching/openclaw-serial-adapter.git "$HOME\.openclaw\extensions\serial-adapter"
+cd "$HOME\.openclaw\extensions\serial-adapter"
+npm install --omit=dev --ignore-scripts
+```
+
+### Option B: Install via OpenClaw CLI
+
 ```bash
-openclaw plugins install @openclaw/serial-adapter
+openclaw plugins install <path-or-spec>
+```
+
+Examples:
+
+```bash
+openclaw plugins install C:\path\to\openclaw-serial-adapter
+openclaw plugins install /path/to/openclaw-serial-adapter
+```
+
+Note:
+- Registry install by package name only works after this plugin is published to npm.
+- In Windows environments with unstable npm spawn behavior, prefer Option A.
+
+### Verify installation
+
+```bash
+openclaw plugins doctor
+openclaw plugins list --enabled --verbose
+openclaw plugins info serial-adapter --json
 ```
 
 ### Prerequisites
 
 - Python 3.10+ with `pyserial` installed on the host machine
 - Node.js 18+
+- OpenClaw CLI configured locally
 
 ## Plugin Configuration
 
-Add to your OpenClaw project config:
+Add to your OpenClaw config (`openclaw.json`):
 
 ```json
 {
   "plugins": {
-    "serial-adapter": {
-      "serialPort": "/dev/ttyUSB0",
-      "baudrate": 115200,
-      "telemetryPort": 9000,
-      "controlPort": 9001
+    "entries": {
+      "serial-adapter": {
+        "enabled": true,
+        "config": {
+          "serialPort": "COM3",
+          "baudrate": 115200,
+          "telemetryPort": 9000,
+          "controlPort": 9001,
+          "host": "127.0.0.1"
+        }
+      }
     }
   }
 }
@@ -50,7 +88,7 @@ Add to your OpenClaw project config:
 
 | Option | Type | Default | Description |
 |---|---|---|---|
-| `serialPort` | string | *required* | Serial device path |
+| `serialPort` | string | none | Serial device path. If omitted, provide `port` in `serial_connect`. |
 | `baudrate` | number | `115200` | Serial baud rate |
 | `telemetryPort` | number | `9000` | TCP telemetry broadcast port |
 | `controlPort` | number | `9001` | TCP control command port |
@@ -68,6 +106,33 @@ Add to your OpenClaw project config:
 | `serial_poll` | Read available telemetry frames |
 | `serial_send` | Send a control command to serial device |
 | `serial_status` | Get adapter runtime status |
+
+## AI Prompt Examples
+
+Use prompts like these with your OpenClaw agent:
+
+1. Connect and check status:
+```text
+Use serial_connect with port COM3 and baudrate 115200, then call serial_status.
+```
+
+2. Servo sweep test (visible frequency / PWM change):
+```text
+Send motor_pwm commands in steps: 1200, 1400, 1600, 1700.
+Wait 2 seconds between each step.
+After each step, call serial_poll and summarize latest telemetry.
+```
+
+3. Safe stop:
+```text
+Send a final command {"motor_pwm": 0}, then call serial_status.
+```
+
+## Safety Notes
+
+- Keep `unsafePassthrough` as `false` unless you explicitly need unrestricted control keys.
+- Use `allowedCommands` to limit accepted control keys.
+- Keep a conservative `maxControlRate` for initial hardware tests.
 
 ## Development
 
@@ -100,16 +165,16 @@ npm run build
 
 ```
 OpenClaw Gateway
-  └─ serial-adapter plugin (TypeScript)
-       ├─ register() registers tools + service
-       ├─ service.start() → spawn python3 subprocess
-       │    └─ Python SerialAdapter
-       │         ├─ Serial port reader thread
-       │         ├─ TCP telemetry server :9000
-       │         └─ TCP control server :9001
-       ├─ serial_poll tool → TCP client reads :9000
-       ├─ serial_send tool → TCP client writes :9001
-       └─ service.stop() → SIGTERM subprocess
+  -> serial-adapter plugin (TypeScript)
+       -> register() registers tools + service
+       -> service.start() starts python subprocess
+            -> Python SerialAdapter
+                 -> Serial port reader thread
+                 -> TCP telemetry server :9000
+                 -> TCP control server :9001
+       -> serial_poll tool reads :9000
+       -> serial_send tool writes :9001
+       -> service.stop() terminates subprocess
 ```
 
 ## Additional Documentation

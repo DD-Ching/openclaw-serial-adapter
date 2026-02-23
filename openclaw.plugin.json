@@ -19,7 +19,6 @@
       },
       "maxControlRate": { "type": "number", "default": 50 }
     },
-    "required": ["serialPort"],
     "additionalProperties": false
   }
 }
