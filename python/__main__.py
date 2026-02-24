@@ -35,7 +35,7 @@ def _check_dependencies() -> None:
 
 def main() -> None:
     _check_dependencies()
-    parser = argparse.ArgumentParser(description="OpenClaw Serial Adapter subprocess")
+    parser = argparse.ArgumentParser(description="Serial Adapter subprocess")
     parser.add_argument("--port", required=True, help="Serial device path")
     parser.add_argument("--baudrate", type=int, default=115200)
     parser.add_argument("--telemetry-port", type=int, default=9000)

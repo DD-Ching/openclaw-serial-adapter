@@ -1,4 +1,4 @@
-﻿# OpenClaw Serial Adapter v0.3.0 Stable Release
+# Serial Adapter v0.3.0 Stable Release
 
 ## Summary of Features
 

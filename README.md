@@ -1,10 +1,10 @@
-# OpenClaw Serial Adapter
+# Serial Adapter
 
 Universal telemetry adapter plugin for OpenClaw, supporting serial device ingestion with buffered frame parsing and split TCP interfaces for telemetry and control.
 
 ## Overview
 
-`@openclaw/serial-adapter` reads line-delimited serial telemetry, reconstructs fragmented frames with a ring buffer, and exposes data to local clients and automation tools.
+`serial-adapter` reads line-delimited serial telemetry, reconstructs fragmented frames with a ring buffer, and exposes data to local clients and automation tools.
 
 The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP servers, then bridges telemetry and control through OpenClaw tool registrations.
 
@@ -131,7 +131,7 @@ Behavior:
 Use this path when `openclaw plugins install` fails on Windows with spawn-related errors (for example `spawn EINVAL` or `Failed to start CLI`).
 
 ```powershell
-git clone https://github.com/DD-Ching/openclaw-serial-adapter.git "$HOME\.openclaw\extensions\serial-adapter"
+git clone https://github.com/DD-Ching/serial-adapter.git "$HOME\.openclaw\extensions\serial-adapter"
 cd "$HOME\.openclaw\extensions\serial-adapter"
 npm install --omit=dev --ignore-scripts
 ```
@@ -145,8 +145,8 @@ openclaw plugins install <path-or-spec>
 Examples:
 
 ```bash
-openclaw plugins install C:\path\to\openclaw-serial-adapter
-openclaw plugins install /path/to/openclaw-serial-adapter
+openclaw plugins install C:\path\to\serial-adapter
+openclaw plugins install /path/to/serial-adapter
 ```
 
 Note:

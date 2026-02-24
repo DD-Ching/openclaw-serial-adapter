@@ -33,7 +33,7 @@ wheels = [
 ]
 
 [[package]]
-name = "openclaw-serial-adapter"
+name = "serial-adapter"
 version = "0.3.0"
 source = { virtual = "." }
 dependencies = [

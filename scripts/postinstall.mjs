@@ -26,7 +26,7 @@ if (!hasCommand("uv")) {
   console.log(
     [
       "",
-      "[@openclaw/serial-adapter] 'uv' not found — skipping Python env setup.",
+      "[serial-adapter] 'uv' not found — skipping Python env setup.",
       "",
       "  To auto-install Python dependencies, install uv first:",
       "    curl -LsSf https://astral.sh/uv/install.sh | sh",
@@ -40,15 +40,15 @@ if (!hasCommand("uv")) {
 }
 
 try {
-  console.log("[@openclaw/serial-adapter] Setting up Python environment...");
+  console.log("[serial-adapter] Setting up Python environment...");
   execFileSync("uv", ["sync", "--frozen", "--no-dev"], {
     cwd: root,
     stdio: "inherit",
   });
-  console.log("[@openclaw/serial-adapter] Python environment ready.");
+  console.log("[serial-adapter] Python environment ready.");
 } catch (err) {
   console.warn(
-    `[@openclaw/serial-adapter] uv sync failed: ${err.message}\n` +
+    `[serial-adapter] uv sync failed: ${err.message}\n` +
       "  You may need to run 'pip install pyserial' manually."
   );
 }

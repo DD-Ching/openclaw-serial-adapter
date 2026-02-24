@@ -1,1 +1,1 @@
-"""OpenClaw Serial Adapter — Python core package."""
+"""Serial Adapter — Python core package."""
