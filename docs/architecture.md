@@ -68,6 +68,6 @@ When `unsafe_passthrough = true`:
 
 - Telemetry/control split ports prevent channel cross-talk:
   - `9000` telemetry read-only
-  - `9001` control write-only
+  - `9001` control command-ingress (supports optional ACK response)
 - Combined compatibility mode (`tcp_port`) remains available for legacy use
 - Stability tests include long-duration 100Hz telemetry + concurrent control traffic

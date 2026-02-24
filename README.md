@@ -12,7 +12,7 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 
 - RingBuffer-based frame assembly for fragmented serial input
 - TCP telemetry stream (read-only broadcast, default `9000`)
-- TCP control channel (write-only commands, default `9001`)
+- TCP control channel (command ingress, default `9001`, with optional ACK response)
 - Auto serial-port probing with best-effort UNO/USB-serial matching
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
@@ -52,13 +52,7 @@ macOS/Linux:
 node scripts/quick_self_check.js --json
 ```
 
-2. Start OpenClaw gateway with deterministic env (Windows):
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
-```
-
-macOS/Linux (if `openclaw` is already in PATH):
+2. Start OpenClaw gateway:
 
 ```bash
 openclaw gateway start
@@ -268,10 +262,10 @@ Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
 
 ## Development
 
-### Run self-test
+### Run core tests
 
 ```bash
-python -m python.self_test
+python -m pytest tests/test_tcp_server.py tests/test_adapter.py
 ```
 
 ### Monitor telemetry (standalone)

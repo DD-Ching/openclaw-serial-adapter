@@ -6,7 +6,7 @@
 - Structured telemetry frames (`timestamp`, `raw`, `parsed`, `meta`)
 - Split TCP channels:
   - Telemetry broadcast: `9000` (read-only)
-  - Control input: `9001` (write-only)
+  - Control input: `9001` (command ingress, optional ACK response)
 - Observer APIs:
   - `poll()`
   - `poll_all()`
@@ -38,7 +38,7 @@
 
 ## Known Limitations
 
-- Control port is write-only by design; no ACK payload is returned to control clients.
+- Control port is command-ingress first; some clients may ignore ACK responses by design.
 - Telemetry stream is local TCP plaintext JSON; no TLS/auth layer is included in this plugin.
 - JSON payloads must be newline-delimited and UTF-8 encoded.
 
@@ -47,23 +47,23 @@
 Run plugin self-test:
 
 ```bash
-python -m plugins.serial_adapter.self_test
+python -m pytest tests/test_tcp_server.py tests/test_adapter.py
 ```
 
 Run 10-minute stability test:
 
 ```bash
-python plugins/serial_adapter/stability_test.py
+python tests/stability_test.py
 ```
 
 Monitor telemetry:
 
 ```bash
-python plugins/serial_adapter/examples/tcp_monitor.py --host 127.0.0.1 --port 9000
+python examples/tcp_monitor.py --host 127.0.0.1 --port 9000
 ```
 
 Send control command:
 
 ```bash
-python plugins/serial_adapter/examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
+python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"target_velocity\":1.5}"
 ```

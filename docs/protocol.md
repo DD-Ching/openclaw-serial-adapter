@@ -3,7 +3,7 @@
 ## Default TCP Ports
 
 - Telemetry port: `9000` (read-only broadcast)
-- Control port: `9001` (write-only command ingress)
+- Control port: `9001` (command ingress, optional ACK response)
 
 ## Telemetry Frame Schema
 
