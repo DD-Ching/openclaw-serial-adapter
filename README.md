@@ -117,6 +117,7 @@ Behavior:
 - `pause` closes serial handle but keeps plugin process/TCP ports alive.
 - During pause, adapter does not occupy COM.
 - After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
+- If there is no COM conflict, keep runtime normal (no pause/resume needed).
 
 ## Installation
 
@@ -130,13 +131,30 @@ cd "$HOME\.openclaw\extensions\serial-adapter"
 npm install --omit=dev --ignore-scripts
 ```
 
-### Option B: Install via OpenClaw CLI
+### Option B: Install via OpenClaw CLI (official flow)
 
 ```bash
 openclaw plugins install <path-or-spec>
 ```
 
-Examples:
+From npm registry (recommended for general users):
+
+```bash
+openclaw plugins install serial-adapter
+```
+
+Optional pinned version:
+
+```bash
+openclaw plugins install serial-adapter@0.3.2
+```
+
+Package contents for Option B include:
+- core OpenClaw plugin (`dist/` + `python/`)
+- observer/control bridge scripts (`plugins/openclaw_ts_bridge/`)
+- algorithm blocks runtime build (`plugins/algorithm_blocks_ts/dist/`)
+
+From local path:
 
 ```bash
 openclaw plugins install C:\path\to\serial-adapter
@@ -144,7 +162,6 @@ openclaw plugins install /path/to/serial-adapter
 ```
 
 Note:
-- Registry install by package name only works after this plugin is published to npm.
 - In Windows environments with unstable npm spawn behavior, prefer Option A.
 
 ### Verify installation
@@ -160,6 +177,9 @@ openclaw plugins info serial-adapter --json
 - Python 3.10+ with `pyserial` installed on the host machine
 - Node.js 18+
 - OpenClaw CLI configured locally
+- Python auto-selection order:
+  - Windows: `.venv` -> `python` -> `py` -> `python3`
+  - macOS/Linux: `.venv` -> `python3` -> `python`
 
 ## Plugin Configuration
 

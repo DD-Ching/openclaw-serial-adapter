@@ -15,7 +15,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 function hasCommand(cmd) {
   try {
-    execFileSync("which", [cmd], { stdio: "ignore" });
+    const probe = process.platform === "win32" ? "where" : "which";
+    execFileSync(probe, [cmd], { stdio: "ignore" });
     return true;
   } catch {
     return false;

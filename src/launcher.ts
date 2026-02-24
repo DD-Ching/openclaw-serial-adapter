@@ -140,10 +140,47 @@ function ensureVenv(): boolean {
   }
 }
 
+function canRunPythonCandidate(command: string): boolean {
+  try {
+    execFileSync(command, ["-c", "import sys"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isLikelyPath(value: string): boolean {
+  const text = value.trim();
+  if (!text) return false;
+  if (text.includes("/") || text.includes("\\")) return true;
+  return text.toLowerCase().endsWith(".exe");
+}
+
 function resolvePython(config: Pick<PluginConfig, "pythonPath">): string {
-  if (config.pythonPath) return config.pythonPath;
+  const configured = config.pythonPath?.trim();
+  if (configured) {
+    if (isLikelyPath(configured)) return configured;
+    if (canRunPythonCandidate(configured)) return configured;
+
+    if (process.platform === "win32" && configured.toLowerCase() === "python3") {
+      for (const candidate of ["python", "py"]) {
+        if (canRunPythonCandidate(candidate)) return candidate;
+      }
+    }
+    return configured;
+  }
+
   if (ensureVenv()) return VENV_PYTHON;
-  return "python3";
+
+  const candidates =
+    process.platform === "win32"
+      ? ["python", "py", "python3"]
+      : ["python3", "python"];
+  for (const candidate of candidates) {
+    if (canRunPythonCandidate(candidate)) return candidate;
+  }
+
+  return process.platform === "win32" ? "python" : "python3";
 }
 
 function normalizePortInfo(raw: unknown): SerialPortInfo | null {
@@ -319,7 +356,12 @@ export class PythonLauncher {
 
     const pythonPath = resolvePython(this.config);
     this.pythonPathInUse = pythonPath;
-    if (!existsSync(pythonPath) && pythonPath === this.config.pythonPath) {
+    if (
+      this.config.pythonPath &&
+      isLikelyPath(this.config.pythonPath) &&
+      !existsSync(pythonPath) &&
+      pythonPath === this.config.pythonPath
+    ) {
       throw new Error(makePythonMissingMessage(pythonPath));
     }
     this.resolvedPort = launchPort;

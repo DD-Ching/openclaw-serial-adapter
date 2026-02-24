@@ -1,6 +1,6 @@
 {
   "name": "serial-adapter",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Serial device telemetry adapter plugin for OpenClaw",
   "license": "MIT",
   "author": "DD-Ching",
@@ -32,11 +32,12 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:algorithm-blocks": "npm --prefix plugins/algorithm_blocks_ts ci --no-audit --no-fund && npm --prefix plugins/algorithm_blocks_ts run build",
     "test": "uv run pytest tests/ -x",
     "quick-check": "node scripts/quick_self_check.js",
     "postinstall": "node scripts/postinstall.mjs",
     "prepare": "node scripts/prepare.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run build && npm run build:algorithm-blocks"
   },
   "openclaw": {
     "extensions": [
@@ -60,6 +61,10 @@
   },
   "files": [
     "dist/",
+    "plugins/openclaw_ts_bridge/*.js",
+    "plugins/openclaw_ts_bridge/*.json",
+    "plugins/openclaw_ts_bridge/README.md",
+    "plugins/algorithm_blocks_ts/dist/",
     "python/*.py",
     "scripts/",
     "openclaw.plugin.json",
