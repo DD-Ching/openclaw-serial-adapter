@@ -112,6 +112,18 @@ def test_tcp_control_forwarding(
     )
 
 
+def test_tcp_control_raw_numeric_line_forwarding(
+    adapter_with_tcp: SerialAdapter,
+    fake_serial: FakeSerial,
+    control_client: socket.socket,
+):
+    control_client.sendall(b"90\n")
+    assert wait_for(
+        lambda: any(item == b"90|" for item in fake_serial.writes),
+        timeout=2.0,
+    )
+
+
 def test_tcp_control_rejection(
     adapter_with_tcp: SerialAdapter,
     fake_serial: FakeSerial,
@@ -228,6 +240,23 @@ def test_invalid_json_frame(
     assert invalid is not None
     assert invalid["raw"] == "not-json"
     assert invalid["parsed"] is None
+
+
+def test_key_value_text_frame_parsing(
+    adapter_with_tcp: SerialAdapter, fake_serial: FakeSerial
+):
+    fake_serial.feed(b"ax:-12872 ay:-1744 az:7788 gx:-656 gy:335 gz:96 servo:103|")
+    assert wait_for(lambda: adapter_with_tcp.get_latest_frame() is not None, timeout=2.0)
+
+    frame = adapter_with_tcp.poll()
+    assert frame is not None
+    assert frame["parsed"] is not None
+    assert frame["parsed"]["ax"] == -12872
+    assert frame["parsed"]["ay"] == -1744
+    assert frame["parsed"]["az"] == 7788
+    assert frame["parsed"]["servo"] == 103
+    assert frame["ax"] == -12872
+    assert frame["servo"] == 103
 
 
 def test_statistics(adapter_with_tcp: SerialAdapter, fake_serial: FakeSerial):

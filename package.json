@@ -6,6 +6,7 @@
   "scripts": {
     "build": "tsc",
     "test": "uv run pytest tests/ -x",
+    "quick-check": "node scripts/quick_self_check.js",
     "postinstall": "node scripts/postinstall.mjs",
     "prepare": "husky"
   },

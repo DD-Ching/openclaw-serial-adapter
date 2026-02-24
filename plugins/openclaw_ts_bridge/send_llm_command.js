@@ -129,7 +129,11 @@ function sendControlPayload({ host, port, payload, responseTimeoutMs }) {
     };
 
     socket.on("connect", () => {
-      socket.write(JSON.stringify(payload) + "\n");
+      if (typeof payload === "string") {
+        socket.write(payload);
+      } else {
+        socket.write(JSON.stringify(payload) + "\n");
+      }
       if (responseTimeoutMs <= 0) {
         finish({ sent: true, response: null });
       }
@@ -151,13 +155,30 @@ function sendControlPayload({ host, port, payload, responseTimeoutMs }) {
     });
 
     socket.on("error", (error) => {
-      finish({ sent: false, error: String(error), response: null });
+      finish({
+        sent: false,
+        error: String(error),
+        error_code: typeof error?.code === "string" ? error.code : null,
+        response: null,
+      });
     });
 
     socket.setTimeout(responseTimeoutMs, () => {
       finish({ sent: true, response: null });
     });
   });
+}
+
+function classifySendFailure(sendResult, host, port) {
+  if (!sendResult || sendResult.sent) return null;
+  const code = sendResult.error_code;
+  if (code === "ECONNREFUSED") {
+    return `Control port not listening at ${host}:${port} (ECONNREFUSED). Start control channel (serial-adapter or control_bridge.js) first.`;
+  }
+  if (code === "ETIMEDOUT") {
+    return `Control port timeout at ${host}:${port}. Check host/port and firewall rules.`;
+  }
+  return `Control send failed at ${host}:${port}.`;
 }
 
 async function runOne(command, context) {
@@ -195,6 +216,7 @@ async function runOne(command, context) {
     payload: translated.translated,
     responseTimeoutMs: context.responseTimeoutMs,
   });
+  const nextStep = classifySendFailure(sendResult, context.host, context.port);
 
   console.log(
     JSON.stringify({
@@ -203,6 +225,7 @@ async function runOne(command, context) {
       input: command,
       translated: translated.translated,
       send: sendResult,
+      next_step: nextStep,
       limiter: context.rateLimiter.state(),
     }),
   );

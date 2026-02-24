@@ -20,6 +20,110 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - Runtime status reporting (`get_status`)
 - Stability tested with long-duration 100Hz telemetry run
 
+## Current Component Inventory
+
+Stable and kept:
+- TS/Node plugin integration layer: `index.ts`, `src/launcher.ts`, `src/tcp-client.ts`
+- Python runtime adapter (transport + safety): `python/` (kept as runtime backend)
+- TS algorithm blocks core: `plugins/algorithm_blocks_ts`
+- Observer bridge and summary/events: `plugins/openclaw_ts_bridge/bridge.js`
+- LLM-safe low-rate control entry: `plugins/openclaw_ts_bridge/send_llm_command.js`
+- Minimal TCP-to-COM control bridge (Windows MVP): `plugins/openclaw_ts_bridge/control_bridge.js`
+
+Legacy or optional (kept, not removed):
+- Python example scripts in `examples/` and `python/` for direct testing
+- Experimental helper scripts under `plugins/openclaw_ts_bridge/` (useful for dev, not required in MVP path)
+
+## MVP Stable Path (Observer + Safe Control)
+
+Goal: read telemetry (`9000`), print low-rate summary, send low-rate control (`9001`) with clear ACK.
+
+1. Quick self-check (node path, dist artifact, port status, serial probe):
+
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/quick_check.ps1 -Json
+```
+
+macOS/Linux:
+
+```bash
+node scripts/quick_self_check.js --json
+```
+
+2. Start OpenClaw gateway with deterministic env (Windows):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/dev.ps1
+```
+
+macOS/Linux (if `openclaw` is already in PATH):
+
+```bash
+openclaw gateway start
+```
+
+3. Start observer summary bridge (1 line/second, fixed schema):
+
+```bash
+node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
+```
+
+4. Send low-rate control command and read machine-readable ACK:
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
+```
+
+5. Optional UNO MVP control channel (if you use plain servo angle line protocol):
+
+```bash
+node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
+```
+
+## Pre-PR Gate (Required)
+
+Before opening any PR, run and review:
+
+- `docs/release/PRE_PR_CHECKLIST.md`
+
+Rule: if checklist is not fully green, stop and fix first.
+
+## COM Port Guardrail (Upload vs Runtime)
+
+- A single COM port cannot be used by uploader/Serial Monitor and runtime plugin at the same time.
+- Upload phase: close runtime monitor/plugin first.
+- Runtime phase: close Arduino IDE Serial Monitor/uploader first, then start adapter/bridge.
+- On startup failure the plugin now reports available ports and explicit next steps.
+
+### Upload-friendly COM Yield (pause/resume, no full plugin shutdown)
+
+You can now ask runtime to temporarily release COM for upload, then auto/manual resume.
+
+Pause and release COM immediately (hold for 30s):
+
+```bash
+python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"pause\",\"hold_s\":30}"
+```
+
+Resume COM right after upload:
+
+```bash
+python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"resume\"}"
+```
+
+Check runtime serial status:
+
+```bash
+python examples/tcp_control.py --host 127.0.0.1 --port 9001 --command "{\"__adapter_cmd\":\"status\"}"
+```
+
+Behavior:
+- `pause` closes serial handle but keeps plugin process/TCP ports alive.
+- During pause, adapter does not occupy COM.
+- After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
+
 ## Installation
 
 ### Option A (Windows recommended): Manual install
@@ -113,6 +217,8 @@ Add to your OpenClaw config (`openclaw.json`):
 | `serial_send` | Send a control command to serial device |
 | `serial_motion_template` | Run built-in servo motion templates |
 | `serial_status` | Get adapter runtime status |
+| `serial_pause` | Temporarily release COM for upload |
+| `serial_resume` | Re-open COM after upload |
 
 ## AI Prompt Examples
 
@@ -128,6 +234,11 @@ Call serial_probe first and pick the suggested port, then run serial_connect wit
 Send motor_pwm commands in steps: 1200, 1400, 1600, 1700.
 Wait 2 seconds between each step.
 After each step, call serial_poll and summarize latest telemetry.
+```
+
+2b. Raw servo shorthand (MVP):
+```text
+Use serial_send with command "90" (or "A90"), then call serial_status.
 ```
 
 3. Safe stop:

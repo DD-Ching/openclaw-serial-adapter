@@ -30,7 +30,9 @@ class _TcpJsonServerCore:
         frame_delimiter: bytes | str,
         broadcast_enabled: bool,
         command_enabled: bool,
-        command_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
+        command_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
         request_handler: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,
@@ -239,12 +241,21 @@ class _TcpJsonServerCore:
         if not line.strip():
             return
 
+        decoded_line = line.decode("utf-8", errors="replace").strip()
+        if not decoded_line:
+            return
+
         try:
-            payload = json.loads(line.decode("utf-8", errors="replace"))
+            payload = json.loads(decoded_line)
         except json.JSONDecodeError:
+            self._dispatch_raw_control_line(decoded_line)
             return
 
         if not isinstance(payload, dict):
+            if isinstance(payload, str):
+                self._dispatch_raw_control_line(payload.strip())
+            else:
+                self._dispatch_raw_control_line(decoded_line)
             return
 
         if self._request_handler is not None:
@@ -260,7 +271,21 @@ class _TcpJsonServerCore:
             return
 
         try:
-            self._command_handler(payload)
+            response = self._command_handler(payload)
+        except Exception:
+            # Control input path is best-effort.
+            return
+        if isinstance(response, dict):
+            self._enqueue_client_payload(client, response)
+
+    def _dispatch_raw_control_line(self, raw_line: str) -> None:
+        if not self._command_enabled or self._command_handler is None:
+            return
+        candidate = str(raw_line).strip()
+        if not candidate:
+            return
+        try:
+            self._command_handler({"cmd": "raw_line", "line": candidate})
         except Exception:
             # Control input path is best-effort.
             return
@@ -375,7 +400,9 @@ class TcpControlServer(_TcpJsonServerCore):
         port: int = 9001,
         *,
         frame_delimiter: bytes | str = b"\n",
-        command_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
+        command_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
     ) -> None:
         super().__init__(
             host=host,
@@ -397,7 +424,9 @@ class TcpBroadcastServer(_TcpJsonServerCore):
         port: int = 9000,
         *,
         frame_delimiter: bytes | str = b"\n",
-        command_handler: Optional[Callable[[Dict[str, Any]], None]] = None,
+        command_handler: Optional[
+            Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+        ] = None,
         request_handler: Optional[
             Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
         ] = None,

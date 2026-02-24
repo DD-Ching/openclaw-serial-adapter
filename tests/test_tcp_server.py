@@ -160,7 +160,7 @@ class TestTcpControlServer:
         finally:
             server.stop()
 
-    def test_ignores_invalid_json(self):
+    def test_forwards_invalid_json_as_raw_line(self):
         received: List[Dict[str, Any]] = []
         port = find_free_port()
         server = TcpControlServer(port=port, command_handler=received.append)
@@ -169,14 +169,15 @@ class TestTcpControlServer:
             client = socket.create_connection(("127.0.0.1", port), timeout=2.0)
             try:
                 client.sendall(b"not-json\n")
-                time.sleep(0.1)
-                assert len(received) == 0
+                assert wait_for(lambda: len(received) == 1)
+                assert received[0]["cmd"] == "raw_line"
+                assert received[0]["line"] == "not-json"
             finally:
                 client.close()
         finally:
             server.stop()
 
-    def test_ignores_non_dict_json(self):
+    def test_forwards_non_dict_json_as_raw_line(self):
         received: List[Dict[str, Any]] = []
         port = find_free_port()
         server = TcpControlServer(port=port, command_handler=received.append)
@@ -185,8 +186,26 @@ class TestTcpControlServer:
             client = socket.create_connection(("127.0.0.1", port), timeout=2.0)
             try:
                 client.sendall(b'[1,2,3]\n')
-                time.sleep(0.1)
-                assert len(received) == 0
+                assert wait_for(lambda: len(received) == 1)
+                assert received[0]["cmd"] == "raw_line"
+                assert received[0]["line"] == "[1,2,3]"
+            finally:
+                client.close()
+        finally:
+            server.stop()
+
+    def test_forwards_numeric_scalar_as_raw_line(self):
+        received: List[Dict[str, Any]] = []
+        port = find_free_port()
+        server = TcpControlServer(port=port, command_handler=received.append)
+        server.start()
+        try:
+            client = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+            try:
+                client.sendall(b"90\n")
+                assert wait_for(lambda: len(received) == 1)
+                assert received[0]["cmd"] == "raw_line"
+                assert received[0]["line"] == "90"
             finally:
                 client.close()
         finally:

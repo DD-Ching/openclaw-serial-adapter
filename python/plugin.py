@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import threading
 import time
 from collections import deque
@@ -53,6 +54,27 @@ __all__ = [
 
 DEFAULT_ALLOWED_COMMANDS: tuple[str, ...] = ("motor_pwm", "target_velocity")
 DEFAULT_MAX_CONTROL_RATE = 50
+DEFAULT_REOPEN_INTERVAL_S = 2.0
+RAW_CONTROL_PATTERN = re.compile(
+    r"^(?:A-?\d{1,4}|P-?\d{1,5}|-?\d{1,4})$",
+    flags=re.IGNORECASE,
+)
+PROBE_CONTROL_COMMANDS = {
+    "IMU?",
+    "IMU_ON",
+    "TELEMETRY_ON",
+    "STREAM_ON",
+    "ANGLE?",
+    "STATUS?",
+}
+KEY_VALUE_NUMERIC_PATTERN = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(-?\d+(?:\.\d+)?)"
+)
+
+ADAPTER_CMD_KEY = "__adapter_cmd"
+ADAPTER_CMD_PAUSE = "pause"
+ADAPTER_CMD_RESUME = "resume"
+ADAPTER_CMD_STATUS = "status"
 
 
 class SerialAdapter:
@@ -91,6 +113,12 @@ class SerialAdapter:
         self._control_commands_rejected = 0
 
         self._serial: Optional[Any] = None
+        self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
+        self._next_reopen_monotonic = 0.0
+        self._serial_paused = False
+        self._pause_until_monotonic: Optional[float] = None
+        self._serial_reconnect_attempts = 0
+        self._serial_last_error: Optional[str] = None
         self._ring_buffer = RingBuffer(
             buffer_size=buffer_size,
             max_frames=max_frames,
@@ -146,6 +174,11 @@ class SerialAdapter:
     def _reset_runtime_state(self) -> None:
         self._ring_buffer.clear()
         self._statistics.clear()
+        self._serial_reconnect_attempts = 0
+        self._serial_last_error = None
+        self._next_reopen_monotonic = 0.0
+        self._serial_paused = False
+        self._pause_until_monotonic = None
         with self._control_lock:
             self._control_timestamps.clear()
         with self._status_lock:
@@ -158,19 +191,120 @@ class SerialAdapter:
             self._frame_history.clear()
             self._pending_frames.clear()
 
+    def _set_serial_error(self, message: Optional[str]) -> None:
+        with self._state_lock:
+            self._serial_last_error = message
+
+    def _close_serial_transport(self) -> None:
+        with self._serial_lock:
+            if self._serial is None:
+                return
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            finally:
+                self._serial = None
+
+    def _open_serial_transport(self, *, raise_on_error: bool) -> bool:
+        if serial is None:
+            raise RuntimeError("pyserial is not available")
+
+        with self._serial_lock:
+            if self._serial is not None:
+                return True
+            try:
+                # timeout=0 keeps reads non-blocking for the reader loop.
+                self._serial = serial.Serial(self._port, self._baudrate, timeout=0)
+            except Exception as exc:
+                self._serial = None
+                self._set_serial_error(f"{type(exc).__name__}: {exc}")
+                if raise_on_error:
+                    raise RuntimeError(
+                        f"Failed to open serial port: {self._port}"
+                    ) from exc
+                return False
+
+        self._set_serial_error(None)
+        return True
+
+    def pause_serial(self, hold_s: Optional[float] = None) -> None:
+        hold_seconds: Optional[float]
+        if hold_s is None:
+            hold_seconds = None
+        else:
+            try:
+                parsed = float(hold_s)
+            except Exception:
+                parsed = 0.0
+            hold_seconds = parsed if parsed > 0 else None
+
+        with self._state_lock:
+            self._serial_paused = True
+            self._pause_until_monotonic = (
+                time.monotonic() + hold_seconds
+                if hold_seconds is not None
+                else None
+            )
+            self._next_reopen_monotonic = 0.0
+
+        self._ring_buffer.clear()
+        self._close_serial_transport()
+
+    def resume_serial(self) -> None:
+        with self._state_lock:
+            self._serial_paused = False
+            self._pause_until_monotonic = None
+            self._next_reopen_monotonic = 0.0
+            self._serial_reconnect_attempts = 0
+            self._serial_last_error = None
+
+    def _maybe_reopen_serial(self) -> bool:
+        now = time.monotonic()
+        with self._state_lock:
+            if self._serial_paused:
+                if (
+                    self._pause_until_monotonic is not None
+                    and now >= self._pause_until_monotonic
+                ):
+                    self._serial_paused = False
+                    self._pause_until_monotonic = None
+                else:
+                    return False
+            if now < self._next_reopen_monotonic:
+                return False
+            self._next_reopen_monotonic = now + self._serial_reopen_interval_s
+
+        ok = self._open_serial_transport(raise_on_error=False)
+        if ok:
+            with self._state_lock:
+                self._serial_reconnect_attempts = 0
+                self._serial_last_error = None
+            self._ring_buffer.clear()
+            return True
+
+        with self._state_lock:
+            self._serial_reconnect_attempts += 1
+        return False
+
+    def _handle_serial_lost(self, exc: Exception) -> None:
+        now = time.monotonic()
+        with self._state_lock:
+            if self._serial_paused:
+                return
+            self._serial_last_error = f"{type(exc).__name__}: {exc}"
+            self._serial_reconnect_attempts += 1
+            self._next_reopen_monotonic = now + self._serial_reopen_interval_s
+        self._ring_buffer.clear()
+        self._close_serial_transport()
+
     def connect(self) -> bool:
         """Open serial transport and start reader + TCP threads."""
         with self._state_lock:
             if self._serial is not None:
                 return True
-            if serial is None:
-                raise RuntimeError("pyserial is not available")
-            try:
-                # timeout=0 keeps reads non-blocking for the reader loop.
-                self._serial = serial.Serial(self._port, self._baudrate, timeout=0)
-            except Exception as exc:
-                raise RuntimeError(f"Failed to open serial port: {self._port}") from exc
-
+        self._open_serial_transport(raise_on_error=True)
+        with self._state_lock:
             self._reset_runtime_state()
             self._start_locked()
             return True
@@ -227,14 +361,7 @@ class SerialAdapter:
     def disconnect(self) -> None:
         """Stop worker threads and close serial transport."""
         self._stop_threads()
-
-        with self._serial_lock:
-            if self._serial is not None:
-                try:
-                    self._serial.close()
-                finally:
-                    self._serial = None
-
+        self._close_serial_transport()
         self._reset_runtime_state()
 
     def register_callback(self, fn: Callable[[Dict[str, Any]], None]) -> None:
@@ -288,15 +415,17 @@ class SerialAdapter:
 
     def _build_frame(self, frame_bytes: bytes) -> Dict[str, Any]:
         raw = frame_bytes.decode("utf-8", errors="replace")
+        ts_ms = int(time.time() * 1000)
         parsed: Optional[Dict[str, Any]] = None
         try:
             payload = json.loads(raw)
             if isinstance(payload, dict):
                 parsed = payload
         except json.JSONDecodeError:
-            parsed = None
+            parsed = self._try_parse_key_value_text(raw)
 
         frame: Dict[str, Any] = {
+            "ts": ts_ms,
             "timestamp": time.time(),
             "raw": raw,
             "parsed": parsed,
@@ -306,8 +435,38 @@ class SerialAdapter:
             },
         }
         if parsed is not None:
-            frame.update(parsed)
+            for key, value in parsed.items():
+                if key in {"ts", "timestamp", "raw", "parsed", "meta"}:
+                    continue
+                frame[key] = value
         return frame
+
+    def _try_parse_key_value_text(self, raw: str) -> Optional[Dict[str, Any]]:
+        text = str(raw).strip()
+        if not text:
+            return None
+
+        matches = KEY_VALUE_NUMERIC_PATTERN.findall(text)
+        if not matches:
+            return None
+
+        out: Dict[str, Any] = {}
+        for key, numeric_text in matches:
+            normalized_key = str(key).strip().lower()
+            if not normalized_key:
+                continue
+            try:
+                value = float(numeric_text)
+            except ValueError:
+                continue
+            if value.is_integer():
+                out[normalized_key] = int(value)
+            else:
+                out[normalized_key] = float(value)
+
+        if not out:
+            return None
+        return out
 
     def _publish_frame(self, frame: Dict[str, Any]) -> None:
         with self._frame_lock:
@@ -342,15 +501,23 @@ class SerialAdapter:
     def _reader_loop(self) -> None:
         while not self._reader_stop.is_set():
             try:
+                with self._serial_lock:
+                    has_serial = self._serial is not None
+                if not has_serial and not self._maybe_reopen_serial():
+                    time.sleep(self._reader_sleep_s)
+                    continue
+
                 chunk = self._read_serial_chunk_nonblocking()
                 emitted = self._process_chunk(chunk)
                 if not chunk and not emitted:
                     time.sleep(self._reader_sleep_s)
-            except RuntimeError:
+            except RuntimeError as exc:
                 if self._reader_stop.is_set():
                     break
+                self._handle_serial_lost(exc)
                 time.sleep(self._reader_sleep_s)
-            except Exception:
+            except Exception as exc:
+                self._handle_serial_lost(exc)
                 time.sleep(self._reader_sleep_s)
 
     def poll(self) -> Optional[Dict[str, Any]]:
@@ -359,6 +526,8 @@ class SerialAdapter:
             self._reader_thread is not None and self._reader_thread.is_alive()
         )
         if not reader_alive:
+            if not self._maybe_reopen_serial():
+                return None
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
 
@@ -374,6 +543,8 @@ class SerialAdapter:
             self._reader_thread is not None and self._reader_thread.is_alive()
         )
         if not reader_alive:
+            if not self._maybe_reopen_serial():
+                return []
             chunk = self._read_serial_chunk_nonblocking()
             self._process_chunk(chunk)
 
@@ -390,6 +561,11 @@ class SerialAdapter:
         """Write control/command payload to serial transport as JSON frame."""
         if not isinstance(data, dict):
             raise TypeError("data must be a dict")
+
+        with self._serial_lock:
+            has_serial = self._serial is not None
+        if not has_serial:
+            self._maybe_reopen_serial()
 
         payload = (
             json.dumps(
@@ -410,20 +586,232 @@ class SerialAdapter:
                 flush_fn()
         return True
 
-    def _handle_control_command(self, command: Dict[str, Any]) -> None:
+    def write_raw_line(self, line: str) -> bool:
+        """Write a single text command line to serial transport."""
+        normalized = str(line).replace("\r", "").replace("\n", "").strip()
+        if not normalized:
+            raise ValueError("raw line must not be empty")
+
+        payload = normalized.encode("utf-8") + self._ring_buffer.frame_delimiter
+        with self._serial_lock:
+            if self._serial is None:
+                raise RuntimeError("Serial not connected")
+            self._serial.write(payload)
+            flush_fn = getattr(self._serial, "flush", None)
+            if callable(flush_fn):
+                flush_fn()
+        return True
+
+    def _normalize_raw_control_line(self, value: Any) -> Optional[str]:
+        text = str(value).replace("\r", "").replace("\n", "").strip()
+        if not text:
+            return None
+
+        upper = text.upper()
+        if upper in PROBE_CONTROL_COMMANDS:
+            return upper
+
+        if not RAW_CONTROL_PATTERN.fullmatch(text):
+            return None
+
+        head = upper[0]
+        if head == "A":
+            try:
+                angle = int(float(text[1:]))
+            except ValueError:
+                return None
+            if angle < 0 or angle > 180:
+                return None
+            return f"A{angle}"
+
+        if head == "P":
+            try:
+                pulse = int(float(text[1:]))
+            except ValueError:
+                return None
+            if pulse < 500 or pulse > 2500:
+                return None
+            return f"P{pulse}"
+
+        try:
+            angle = int(float(text))
+        except ValueError:
+            return None
+        if angle < 0 or angle > 180:
+            return None
+        return str(angle)
+
+    def _convert_servo_alias_to_raw_line(
+        self, command: Dict[str, Any]
+    ) -> Optional[str]:
+        if len(command) != 1:
+            return None
+        if "servo_pos" in command or "servo_angle" in command:
+            key = "servo_pos" if "servo_pos" in command else "servo_angle"
+            return self._normalize_raw_control_line(f"A{command[key]}")
+        if "servo_pulse" in command or "pulse_us" in command:
+            key = "servo_pulse" if "servo_pulse" in command else "pulse_us"
+            return self._normalize_raw_control_line(f"P{command[key]}")
+        return None
+
+    def _handle_control_command(
+        self, command: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        runtime_cmd = command.get(ADAPTER_CMD_KEY)
+        if isinstance(runtime_cmd, str) and runtime_cmd.strip():
+            return self._handle_runtime_command(command)
+
+        cmd = command.get("cmd")
+        if isinstance(cmd, str):
+            cmd_name = cmd.strip().lower()
+            if cmd_name in {"raw_line", "serial_raw", "raw"}:
+                line = self._normalize_raw_control_line(command.get("line"))
+                if line is None:
+                    self._record_control_rejected()
+                    return {
+                        "type": "control_ack",
+                        "ok": False,
+                        "reason": "invalid_raw_line",
+                        "status": self.get_status(),
+                    }
+                if not self._consume_control_rate_slot():
+                    self._record_control_rejected()
+                    return {
+                        "type": "control_ack",
+                        "ok": False,
+                        "reason": "rate_limited",
+                        "status": self.get_status(),
+                    }
+                try:
+                    self.write_raw_line(line)
+                except Exception as exc:
+                    self._handle_serial_lost(exc)
+                    self._record_control_rejected()
+                    return {
+                        "type": "control_ack",
+                        "ok": False,
+                        "reason": "serial_unavailable",
+                        "status": self.get_status(),
+                    }
+                self._record_control_accepted()
+                return {
+                    "type": "control_ack",
+                    "ok": True,
+                    "reason": "sent_raw",
+                    "line": line,
+                    "status": self.get_status(),
+                }
+
+        servo_line = self._convert_servo_alias_to_raw_line(command)
+        if servo_line is not None:
+            if not self._consume_control_rate_slot():
+                self._record_control_rejected()
+                return {
+                    "type": "control_ack",
+                    "ok": False,
+                    "reason": "rate_limited",
+                    "status": self.get_status(),
+                }
+            try:
+                self.write_raw_line(servo_line)
+            except Exception as exc:
+                self._handle_serial_lost(exc)
+                self._record_control_rejected()
+                return {
+                    "type": "control_ack",
+                    "ok": False,
+                    "reason": "serial_unavailable",
+                    "status": self.get_status(),
+                }
+            self._record_control_accepted()
+            return {
+                "type": "control_ack",
+                "ok": True,
+                "reason": "sent_raw",
+                "line": servo_line,
+                "status": self.get_status(),
+            }
+
         if not self._is_control_command_allowed(command):
             self._record_control_rejected()
-            return
+            return {
+                "type": "control_ack",
+                "ok": False,
+                "reason": "not_allowlisted",
+                "status": self.get_status(),
+            }
         if not self._consume_control_rate_slot():
             self._record_control_rejected()
-            return
+            return {
+                "type": "control_ack",
+                "ok": False,
+                "reason": "rate_limited",
+                "status": self.get_status(),
+            }
         try:
             self.write(command)
-        except Exception:
+        except Exception as exc:
             # Control path is best-effort.
+            self._handle_serial_lost(exc)
             self._record_control_rejected()
-            return
+            return {
+                "type": "control_ack",
+                "ok": False,
+                "reason": "serial_unavailable",
+                "status": self.get_status(),
+            }
         self._record_control_accepted()
+        return {
+            "type": "control_ack",
+            "ok": True,
+            "reason": "sent",
+            "status": self.get_status(),
+        }
+
+    def _handle_runtime_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+        action = str(command.get(ADAPTER_CMD_KEY, "")).strip().lower()
+
+        if action == ADAPTER_CMD_PAUSE:
+            hold_s_raw = command.get("hold_s")
+            hold_s: Optional[float]
+            if isinstance(hold_s_raw, (int, float)):
+                hold_s = float(hold_s_raw)
+            else:
+                hold_s = None
+            self.pause_serial(hold_s=hold_s)
+            return {
+                "type": "adapter_runtime_ack",
+                "ok": True,
+                "action": ADAPTER_CMD_PAUSE,
+                "hold_s": hold_s if hold_s is not None and hold_s > 0 else None,
+                "status": self.get_status(),
+            }
+
+        if action == ADAPTER_CMD_RESUME:
+            self.resume_serial()
+            # Kick an immediate reopen attempt if possible.
+            self._maybe_reopen_serial()
+            return {
+                "type": "adapter_runtime_ack",
+                "ok": True,
+                "action": ADAPTER_CMD_RESUME,
+                "status": self.get_status(),
+            }
+
+        if action == ADAPTER_CMD_STATUS:
+            return {
+                "type": "adapter_runtime_ack",
+                "ok": True,
+                "action": ADAPTER_CMD_STATUS,
+                "status": self.get_status(),
+            }
+
+        return {
+            "type": "adapter_runtime_ack",
+            "ok": False,
+            "error": f"unknown {ADAPTER_CMD_KEY}: {action}",
+            "status": self.get_status(),
+        }
 
     def _is_control_command_allowed(self, command: Dict[str, Any]) -> bool:
         if self._unsafe_passthrough:
@@ -500,6 +888,20 @@ class SerialAdapter:
             control_commands_accepted = int(self._control_commands_accepted)
             control_commands_rejected = int(self._control_commands_rejected)
 
+        with self._serial_lock:
+            serial_connected = self._serial is not None
+
+        with self._state_lock:
+            serial_paused = bool(self._serial_paused)
+            reconnect_attempts = int(self._serial_reconnect_attempts)
+            serial_last_error = self._serial_last_error
+            pause_until = self._pause_until_monotonic
+        pause_remaining_s: Optional[float]
+        if serial_paused and pause_until is not None:
+            pause_remaining_s = max(0.0, pause_until - now)
+        else:
+            pause_remaining_s = None
+
         if self._compat_server is not None:
             connected_clients = self._compat_server.get_client_count()
         else:
@@ -516,6 +918,14 @@ class SerialAdapter:
             "ring_buffer_usage_ratio": self._ring_buffer.usage_ratio,
             "control_commands_accepted": control_commands_accepted,
             "control_commands_rejected": control_commands_rejected,
+            "serial_connected": serial_connected,
+            "serial_paused": serial_paused,
+            "serial_pause_remaining_s": pause_remaining_s,
+            "serial_reconnect_attempts": reconnect_attempts,
+            "serial_last_error": serial_last_error,
+            "serial_port": self._port,
+            "serial_baudrate": int(self._baudrate),
+            "degraded": (not serial_connected) or serial_paused,
         }
 
     def get_tcp_endpoint(self) -> Optional[Tuple[str, int]]:

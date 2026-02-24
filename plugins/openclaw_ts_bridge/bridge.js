@@ -1,18 +1,18 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
 
-import {
-  AlgorithmPipeline,
-  PidBlock,
-  SummarizerBlock,
-} from "../algorithm_blocks_ts/dist/src/index.js";
 import { startControlPlane } from "./control_plane.js";
 
 const BRIDGE_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_PATH = resolve(BRIDGE_DIR, "config.json");
+const ALGO_BLOCKS_DIST_ENTRY = resolve(
+  BRIDGE_DIR,
+  "../algorithm_blocks_ts/dist/src/index.js",
+);
 
 const DEFAULT_CONFIG = {
   telemetry: {
@@ -53,11 +53,6 @@ const DEFAULT_CONFIG = {
       },
     },
   },
-};
-
-const BLOCK_FACTORIES = {
-  summarizer: () => new SummarizerBlock("summary"),
-  pid: () => new PidBlock("pid"),
 };
 
 const BLOCK_ORDER = ["pid", "summarizer"];
@@ -250,6 +245,33 @@ function parseArgs(argv) {
   return out;
 }
 
+async function loadAlgorithmBlocks() {
+  if (!existsSync(ALGO_BLOCKS_DIST_ENTRY)) {
+    throw new Error(
+      [
+        `Missing build artifact: ${ALGO_BLOCKS_DIST_ENTRY}`,
+        "Next step: run only this build step:",
+        "cd plugins/algorithm_blocks_ts && npm run build",
+      ].join(" "),
+    );
+  }
+  return import(pathToFileURL(ALGO_BLOCKS_DIST_ENTRY).href);
+}
+
+function classifySocketError(error, host, port) {
+  const code = typeof error?.code === "string" ? error.code : "UNKNOWN";
+  if (code === "ECONNREFUSED") {
+    return {
+      code,
+      next_step: `Telemetry port not listening at ${host}:${port}. Start serial-adapter runtime first, then retry bridge.`,
+    };
+  }
+  return {
+    code,
+    next_step: "Check telemetry host/port and local firewall rules.",
+  };
+}
+
 function toFrame(rawLine, parsedPayload) {
   const parsed =
     parsedPayload &&
@@ -353,10 +375,16 @@ function createEventDetector(eventConfig) {
   };
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const loadedConfig = loadConfigFile(args.configPath);
   let runtimeConfig = mergeConfig(DEFAULT_CONFIG, loadedConfig);
+  const { AlgorithmPipeline, PidBlock, SummarizerBlock } =
+    await loadAlgorithmBlocks();
+  const blockFactories = {
+    summarizer: () => new SummarizerBlock("summary"),
+    pid: () => new PidBlock("pid"),
+  };
 
   if (typeof args.host === "string" && args.host.trim()) {
     runtimeConfig.telemetry.host = args.host.trim();
@@ -399,7 +427,7 @@ function main() {
     for (const blockName of BLOCK_ORDER) {
       const spec = runtimeConfig.blocks[blockName];
       if (!spec || !spec.enabled) continue;
-      const factory = BLOCK_FACTORIES[blockName];
+      const factory = blockFactories[blockName];
       if (!factory) continue;
       const block = factory();
       block.init(spec.config ?? {});
@@ -602,10 +630,17 @@ function main() {
   });
 
   socket.on("error", (error) => {
+    const classified = classifySocketError(
+      error,
+      runtimeConfig.telemetry.host,
+      runtimeConfig.telemetry.port,
+    );
     console.error(
       JSON.stringify({
         type: "bridge_socket_error",
         message: String(error),
+        code: classified.code,
+        next_step: classified.next_step,
       }),
     );
     shutdown("socket_error");
@@ -624,4 +659,14 @@ function main() {
   process.on("SIGTERM", () => shutdown("sigterm"));
 }
 
-main();
+main().catch((error) => {
+  console.error(
+    JSON.stringify({
+      type: "bridge_fatal",
+      message: String(error),
+      next_step:
+        "Run quick self-check and ensure algorithm_blocks_ts dist exists before starting bridge.",
+    }),
+  );
+  process.exit(1);
+});

@@ -15,6 +15,62 @@ node plugins/openclaw_ts_bridge/bridge.js
 node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
 ```
 
+## Stable Quick Path (3 commands)
+
+1) Start runtime (OpenClaw gateway or serial adapter process) so `9000/9001` can listen.
+
+2) Start summary bridge:
+
+```bash
+node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
+```
+
+3) Send low-rate control and inspect ACK:
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
+```
+
+If control port is not listening, ACK includes explicit `ECONNREFUSED` and `next_step`.
+
+## MPU6050 Minimal Observer
+
+Reads `telemetry:9000` and prints one JSON summary per second (not per frame).
+
+```bash
+node plugins/openclaw_ts_bridge/mpu_summary_observer.js --host 127.0.0.1 --port 9000 --interval-ms 1000
+```
+
+Optional bounded run:
+
+```bash
+node plugins/openclaw_ts_bridge/mpu_summary_observer.js --max-runtime-s 15
+```
+
+Output shape:
+- `frames`: frames seen in this window
+- `parsed_samples`: frames that contained at least one sensor field
+- `keys.ax/ay/az` (+ `gx/gy/gz` if present): `mean/min/max/latest`
+
+## Servo MVP (Windows)
+
+1) Start the control bridge first (TCP `9001` -> `COMx` at `115200`):
+
+```bash
+node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
+```
+
+2) Send a servo command from LLM-safe sender:
+
+```bash
+node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
+```
+
+Notes:
+- `servo_pos` uses MVP plain line protocol: `"<angle>\n"` (for example `90\n`).
+- Bridge writes incoming TCP bytes to UNO serial as-is.
+- If `9001` is not listening, sender returns machine-readable error with `error_code: "ECONNREFUSED"`.
+
 ## Summary Output Schema
 
 Every `interval_ms`, bridge prints exactly:
@@ -99,6 +155,10 @@ This layer enforces:
 - target allowlist when `unsafe_passthrough=false` (default)
 - LLM-side rate limit (default `5 cmd/sec`) before sending to control port
 
+MVP servo protocol:
+- `servo_pos` translates to plain text line `"<angle>\n"` (for example `0\n`, `90\n`, `180\n`)
+- `target_velocity` and `motor_pwm` stay JSON-line payloads
+
 Examples:
 
 1) `servo_pos` 0 / 90 / 180
@@ -128,7 +188,7 @@ Output ACK shape:
   "type": "llm_command_ack",
   "ok": true,
   "input": {"cmd":"set","target":"servo_pos","value":90},
-  "translated": {"servo_angle":90},
+  "translated": "90\n",
   "send": {"sent": true, "response": null},
   "limiter": {"maxCommandsPerSec":5,"inCurrentWindow":1,"remaining":4}
 }

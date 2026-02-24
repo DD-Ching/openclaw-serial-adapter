@@ -130,17 +130,18 @@ export function translateLlmCommand(command, policy = DEFAULT_LLM_POLICY) {
         },
       };
     case "servo_pos":
-      return {
-        ok: true,
-        translated: {
-          servo_angle: clamp(Math.round(Number(command.value)), 0, 180),
-        },
-        normalized: {
-          cmd: "set",
-          target: "servo_pos",
-          value: clamp(Math.round(Number(command.value)), 0, 180),
-        },
-      };
+      {
+        const angle = clamp(Math.round(Number(command.value)), 0, 180);
+        return {
+          ok: true,
+          translated: `${angle}\n`,
+          normalized: {
+            cmd: "set",
+            target: "servo_pos",
+            value: angle,
+          },
+        };
+      }
     default:
       return {
         ok: false,

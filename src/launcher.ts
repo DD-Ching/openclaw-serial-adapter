@@ -29,6 +29,99 @@ const VENV_PYTHON = resolve(
 
 const execFileAsync = promisify(execFile);
 
+function asErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
+function formatPortsForMessage(ports: SerialPortInfo[]): string {
+  if (!ports.length) return "<none>";
+  return ports
+    .map((port) => {
+      const details = [port.product, port.description, port.manufacturer]
+        .filter((item): item is string => typeof item === "string" && item.length > 0)
+        .join(" | ");
+      return details ? `${port.device} (${details})` : port.device;
+    })
+    .join(", ");
+}
+
+function makePythonMissingMessage(pythonPath: string): string {
+  return [
+    `Python executable not found: ${pythonPath}`,
+    "Next step: set plugins.entries.serial-adapter.config.pythonPath to an absolute python path, then retry.",
+    "Example (Windows): C:\\Python311\\python.exe",
+  ].join(" ");
+}
+
+function makePyserialMissingMessage(pythonPath: string): string {
+  return [
+    `Python dependency missing (pyserial) for interpreter: ${pythonPath}`,
+    "Next step: install pyserial in that interpreter and retry.",
+    "Command: python -m pip install pyserial",
+  ].join(" ");
+}
+
+function isPortBusyError(stderr: string): boolean {
+  const text = stderr.toLowerCase();
+  return (
+    text.includes("failed to open serial port") ||
+    text.includes("could not open port") ||
+    text.includes("access is denied") ||
+    text.includes("permissionerror") ||
+    text.includes("resource busy") ||
+    text.includes("device or resource busy")
+  );
+}
+
+function isPyserialMissingError(stderr: string): boolean {
+  const text = stderr.toLowerCase();
+  return (
+    text.includes("required python package 'pyserial'") ||
+    text.includes("no module named 'serial'") ||
+    text.includes('no module named "serial"')
+  );
+}
+
+function makePortBusyMessage(
+  launchPort: string,
+  availablePorts: SerialPortInfo[]
+): string {
+  return [
+    `Failed to open serial port ${launchPort} (likely occupied by another process).`,
+    "Close Arduino IDE Serial Monitor, uploader, arduino-cli monitor, or any other app using the same COM port, then retry.",
+    `Available serial ports: ${formatPortsForMessage(availablePorts)}`,
+    "Note: upload (flash) and runtime monitor cannot hold the same COM port at the same time.",
+  ].join(" ");
+}
+
+function makeGenericStartupFailureMessage(
+  launchPort: string,
+  availablePorts: SerialPortInfo[],
+  details: string
+): string {
+  return [
+    `Python adapter failed to start on serial port ${launchPort}.`,
+    `Available serial ports: ${formatPortsForMessage(availablePorts)}`,
+    `Details: ${details || "<empty>"}`,
+  ].join(" ");
+}
+
+function classifyStartupFailure(
+  launchPort: string,
+  availablePorts: SerialPortInfo[],
+  pythonPath: string,
+  details: string
+): string {
+  if (isPyserialMissingError(details)) {
+    return makePyserialMissingMessage(pythonPath);
+  }
+  if (isPortBusyError(details)) {
+    return makePortBusyMessage(launchPort, availablePorts);
+  }
+  return makeGenericStartupFailureMessage(launchPort, availablePorts, details);
+}
+
 function ensureVenv(): boolean {
   if (existsSync(VENV_PYTHON)) return true;
   try {
@@ -183,6 +276,8 @@ export class PythonLauncher {
   private config: PluginConfig;
   private readyMessage: ReadyMessage | null = null;
   private resolvedPort: string | null = null;
+  private lastProbePorts: SerialPortInfo[] = [];
+  private pythonPathInUse: string | null = null;
 
   constructor(config: PluginConfig) {
     this.config = config;
@@ -194,6 +289,7 @@ export class PythonLauncher {
     if (this.config.autoDetectSerialPort === false) return null;
 
     const ports = await listSerialPorts(this.config);
+    this.lastProbePorts = ports;
     const chosen = chooseBestSerialPort(ports, this.config.portHints);
     return chosen?.device ?? null;
   }
@@ -204,48 +300,75 @@ export class PythonLauncher {
     }
 
     const launchPort = await this.resolveLaunchPort();
+    if (this.lastProbePorts.length === 0) {
+      try {
+        this.lastProbePorts = await listSerialPorts(this.config);
+      } catch {
+        this.lastProbePorts = [];
+      }
+    }
     if (!launchPort) {
       throw new Error(
-        "No serial port configured or auto-detected. Use serial_probe or set plugins.entries.serial-adapter.config.serialPort."
+        [
+          "No serial port configured or auto-detected.",
+          `Available serial ports: ${formatPortsForMessage(this.lastProbePorts)}`,
+          "Next step: run serial_probe or set plugins.entries.serial-adapter.config.serialPort.",
+        ].join(" ")
       );
     }
 
     const pythonPath = resolvePython(this.config);
+    this.pythonPathInUse = pythonPath;
+    if (!existsSync(pythonPath) && pythonPath === this.config.pythonPath) {
+      throw new Error(makePythonMissingMessage(pythonPath));
+    }
     this.resolvedPort = launchPort;
 
-    this.process = spawn(
-      pythonPath,
-      [
-        "-m",
-        "python",
-        "--port",
-        launchPort,
-        "--baudrate",
-        String(this.config.baudrate ?? 115200),
-        "--telemetry-port",
-        String(this.config.telemetryPort ?? 9000),
-        "--control-port",
-        String(this.config.controlPort ?? 9001),
-        "--host",
-        this.config.host ?? "127.0.0.1",
-      ],
-      {
-        cwd: PKG_ROOT,
-        stdio: ["ignore", "pipe", "pipe"],
-      }
-    );
+    try {
+      this.process = spawn(
+        pythonPath,
+        [
+          "-m",
+          "python",
+          "--port",
+          launchPort,
+          "--baudrate",
+          String(this.config.baudrate ?? 115200),
+          "--telemetry-port",
+          String(this.config.telemetryPort ?? 9000),
+          "--control-port",
+          String(this.config.controlPort ?? 9001),
+          "--host",
+          this.config.host ?? "127.0.0.1",
+        ],
+        {
+          cwd: PKG_ROOT,
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
+    } catch (error) {
+      throw new Error(
+        classifyStartupFailure(
+          launchPort,
+          this.lastProbePorts,
+          pythonPath,
+          asErrorMessage(error)
+        )
+      );
+    }
 
     this.process.on("exit", () => {
       this.process = null;
       this.readyMessage = null;
       this.resolvedPort = null;
+      this.pythonPathInUse = null;
     });
 
-    this.readyMessage = await this.waitForReady();
+    this.readyMessage = await this.waitForReady(launchPort);
     return this.readyMessage;
   }
 
-  private waitForReady(): Promise<ReadyMessage> {
+  private waitForReady(launchPort: string): Promise<ReadyMessage> {
     return new Promise((resolveReady, rejectReady) => {
       if (!this.process?.stdout) {
         rejectReady(new Error("No stdout on Python process"));
@@ -271,7 +394,7 @@ export class PythonLauncher {
       const timeout = setTimeout(() => {
         settleReject(
           new Error(
-            `Python subprocess did not become ready within ${READY_TIMEOUT_MS}ms`
+            `Python subprocess did not become ready within ${READY_TIMEOUT_MS}ms. Next step: verify python + pyserial and check COM occupancy on ${launchPort}.`
           )
         );
         void this.stop();
@@ -279,27 +402,59 @@ export class PythonLauncher {
 
       const rl = createInterface({ input: this.process.stdout });
       let stderr = "";
+      const stdoutPreview: string[] = [];
 
       this.process.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString();
       });
 
-      rl.once("line", (line) => {
+      rl.on("line", (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        if (stdoutPreview.length < 3) stdoutPreview.push(trimmed);
         try {
-          const msg = JSON.parse(line) as ReadyMessage;
-          if (msg.status !== "ready") {
-            settleReject(new Error(`Unexpected status: ${msg.status}`));
-            return;
+          const msg = JSON.parse(trimmed) as ReadyMessage;
+          if (msg.status === "ready") {
+            settleResolve(msg);
           }
-          settleResolve(msg);
         } catch {
-          settleReject(new Error(`Failed to parse ready message: ${line}`));
+          // Allow non-JSON logs before ready line.
         }
       });
 
-      this.process.once("exit", (code) => {
+      this.process.once("error", (error) => {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "ENOENT") {
+          settleReject(
+            new Error(makePythonMissingMessage(this.pythonPathInUse ?? "python3"))
+          );
+          return;
+        }
         settleReject(
-          new Error(`Python subprocess exited with code ${code}: ${stderr}`)
+          new Error(
+            classifyStartupFailure(
+              launchPort,
+              this.lastProbePorts,
+              this.pythonPathInUse ?? "python3",
+              asErrorMessage(error)
+            )
+          )
+        );
+      });
+
+      this.process.once("exit", (code) => {
+        const detail = [stderr.trim(), stdoutPreview.join(" | ").trim()]
+          .filter((part) => part.length > 0)
+          .join(" | ");
+        settleReject(
+          new Error(
+            classifyStartupFailure(
+              launchPort,
+              this.lastProbePorts,
+              this.pythonPathInUse ?? "python3",
+              detail || `process exited with code ${code}`
+            )
+          )
         );
       });
     });
@@ -312,6 +467,7 @@ export class PythonLauncher {
     this.process = null;
     this.readyMessage = null;
     this.resolvedPort = null;
+    this.pythonPathInUse = null;
 
     return new Promise<void>((resolveStop) => {
       const timeout = setTimeout(() => {
@@ -338,5 +494,9 @@ export class PythonLauncher {
 
   getResolvedPort(): string | null {
     return this.resolvedPort;
+  }
+
+  getLastProbePorts(): SerialPortInfo[] {
+    return this.lastProbePorts.map((port) => ({ ...port }));
   }
 }

@@ -38,6 +38,89 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+function toErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
+type NormalizedSerialCommand =
+  | {
+      mode: "json";
+      payload: Record<string, unknown>;
+      source: string;
+    }
+  | {
+      mode: "raw";
+      payload: string;
+      source: string;
+    };
+
+function normalizeSerialSendCommand(
+  candidate: unknown
+): NormalizedSerialCommand | null {
+  if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+    return {
+      mode: "json",
+      payload: candidate as Record<string, unknown>,
+      source: "json_object",
+    };
+  }
+
+  if (typeof candidate === "number" && Number.isFinite(candidate)) {
+    return {
+      mode: "raw",
+      payload: String(Math.trunc(candidate)),
+      source: "numeric_scalar",
+    };
+  }
+
+  if (typeof candidate !== "string") {
+    return null;
+  }
+
+  const text = candidate.trim();
+  if (!text) return null;
+
+  try {
+    const parsed = JSON.parse(text) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return {
+        mode: "json",
+        payload: parsed as Record<string, unknown>,
+        source: "json_string",
+      };
+    }
+  } catch {
+    // fall through to shorthand raw
+  }
+
+  const upper = text.toUpperCase();
+  if (
+    /^A-?\d{1,4}$/.test(upper) ||
+    /^P-?\d{1,5}$/.test(upper) ||
+    /^-?\d{1,4}$/.test(text)
+  ) {
+    return {
+      mode: "raw",
+      payload: upper.startsWith("A") || upper.startsWith("P") ? upper : text,
+      source: "raw_shorthand",
+    };
+  }
+
+  return {
+    mode: "raw",
+    payload: text,
+    source: "raw_text",
+  };
+}
+
+function compactPortInfo(configuredPort: string | null, allPorts: ReturnType<PythonLauncher["getLastProbePorts"]>) {
+  return {
+    selected: configuredPort,
+    available: allPorts.map((port) => port.device),
+  };
+}
+
 function buildMotionSequence(
   template: MotionTemplateName,
   options: {
@@ -75,22 +158,46 @@ async function connectAdapter(config: PluginConfig) {
   const ready = await launcher.start();
 
   const host = config.host ?? "127.0.0.1";
+  const resolvedPort = launcher.getResolvedPort() ?? config.serialPort ?? null;
+  const portInfo = compactPortInfo(resolvedPort, launcher.getLastProbePorts());
 
   telemetryClient = new TelemetryClient();
-  await telemetryClient.connect(host, ready.telemetry_port);
-
   controlClient = new ControlClient();
-  await controlClient.connect(host, ready.control_port);
+  try {
+    await telemetryClient.connect(host, ready.telemetry_port);
+    await controlClient.connect(host, ready.control_port);
+  } catch (error) {
+    telemetryClient?.disconnect();
+    telemetryClient = null;
+    controlClient?.disconnect();
+    controlClient = null;
+    await launcher.stop();
+    launcher = null;
+    throw new Error(
+      [
+        "Adapter subprocess started, but channel attachment failed.",
+        toErrorMessage(error),
+      ].join(" ")
+    );
+  }
 
   const result = {
     status: "connected" as const,
-    serial_port: launcher.getResolvedPort() ?? config.serialPort ?? null,
+    serial_port: resolvedPort,
+    serial_ports_available: portInfo.available,
     telemetry_port: ready.telemetry_port,
     control_port: ready.control_port,
     pid: ready.pid,
   };
   log.info(
-    `Adapter connected on ${result.serial_port ?? "<unknown-port>"} telemetry:${ready.telemetry_port} control:${ready.control_port}`
+    JSON.stringify({
+      event: "serial_adapter_connected",
+      serial_port: result.serial_port,
+      serial_ports_available: result.serial_ports_available,
+      telemetry_port: result.telemetry_port,
+      control_port: result.control_port,
+      pid: result.pid,
+    })
   );
   return result;
 }
@@ -102,7 +209,11 @@ async function disconnectAdapter() {
   controlClient = null;
   await launcher?.stop();
   launcher = null;
-  log.info("Adapter disconnected");
+  log.info(
+    JSON.stringify({
+      event: "serial_adapter_disconnected",
+    })
+  );
 }
 
 const plugin = {
@@ -129,7 +240,14 @@ const plugin = {
           await connectAdapter(config);
         } catch (error) {
           // Service should not crash the full gateway on boot.
-          log.warn(`serial-adapter auto-start skipped: ${String(error)}`);
+          log.warn(
+            JSON.stringify({
+              event: "serial_adapter_autostart_skipped",
+              error: toErrorMessage(error),
+              next_step:
+                "Run serial_probe, ensure COM is not occupied, then call serial_connect.",
+            })
+          );
         }
       },
       async stop() {
@@ -159,7 +277,11 @@ const plugin = {
             suggested: suggested?.device ?? null,
           });
         } catch (error) {
-          return jsonResult({ error: String(error) });
+          return jsonResult({
+            error: toErrorMessage(error),
+            next_step:
+              "Ensure Python + pyserial are available, then run serial_probe again.",
+          });
         }
       },
     });
@@ -200,7 +322,11 @@ const plugin = {
         try {
           return jsonResult(await connectAdapter(dynamicConfig));
         } catch (error) {
-          return jsonResult({ error: String(error) });
+          return jsonResult({
+            error: toErrorMessage(error),
+            next_step:
+              "Run serial_probe, close Arduino Serial Monitor/uploader on the same COM, then retry serial_connect.",
+          });
         }
       },
     });
@@ -230,8 +356,9 @@ const plugin = {
       label: "Send Command",
       description: "Send a control command to serial device",
       parameters: Type.Object({
-        command: Type.Record(Type.String(), Type.Unknown(), {
-          description: "JSON command payload",
+        command: Type.Unknown({
+          description:
+            "Control payload. Supports JSON object or shorthand text (A90/P1500/90).",
         }),
       }),
       async execute(_toolCallId, params) {
@@ -240,8 +367,26 @@ const plugin = {
             error: "Not connected. Call serial_connect first.",
           });
         }
-        controlClient.sendCommand(params.command as Record<string, unknown>);
-        return jsonResult({ status: "sent" });
+        const normalized = normalizeSerialSendCommand(params.command);
+        if (!normalized) {
+          return jsonResult({
+            error:
+              "Invalid command format. Use JSON object or shorthand text (A90/P1500/90).",
+          });
+        }
+
+        if (normalized.mode === "json") {
+          controlClient.sendCommand(normalized.payload);
+        } else {
+          controlClient.sendRawLine(normalized.payload);
+        }
+
+        return jsonResult({
+          status: "sent",
+          mode: normalized.mode,
+          source: normalized.source,
+          normalized: normalized.payload,
+        });
       },
     });
 
@@ -319,6 +464,56 @@ const plugin = {
           port: launcher.getResolvedPort() ?? config.serialPort ?? null,
           ready: launcher.getReadyMessage(),
         });
+      },
+    });
+
+    api.registerTool({
+      name: "serial_pause",
+      label: "Pause Serial",
+      description:
+        "Temporarily release COM for firmware upload (adapter stays alive)",
+      parameters: Type.Object({
+        seconds: Type.Optional(
+          Type.Number({
+            description: "Pause duration seconds (default 25, 0 = manual resume)",
+            minimum: 0,
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        if (!controlClient) {
+          return jsonResult({
+            error: "Not connected. Call serial_connect first.",
+          });
+        }
+        const holdS =
+          typeof params.seconds === "number"
+            ? Math.max(0, Math.min(params.seconds, 300))
+            : 25;
+        controlClient.sendCommand({
+          __adapter_cmd: "pause",
+          hold_s: holdS > 0 ? holdS : undefined,
+        });
+        return jsonResult({
+          status: "pause_requested",
+          hold_s: holdS > 0 ? holdS : null,
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "serial_resume",
+      label: "Resume Serial",
+      description: "Re-open COM after upload",
+      parameters: Type.Object({}),
+      async execute() {
+        if (!controlClient) {
+          return jsonResult({
+            error: "Not connected. Call serial_connect first.",
+          });
+        }
+        controlClient.sendCommand({ __adapter_cmd: "resume" });
+        return jsonResult({ status: "resume_requested" });
       },
     });
   },
