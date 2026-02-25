@@ -333,6 +333,9 @@ async function sendBestEffortStopSequence(options: {
   const intervalMs = Math.max(20, Math.min(Math.floor(options.intervalMs), 1000));
 
   for (let i = 0; i < repeats; i += 1) {
+    // Stop keywords for firmware that implements explicit stop/sweep toggles.
+    controlClient.sendRawLine("STOP");
+    controlClient.sendRawLine("SWEEP_OFF");
     // Send both plain angle and A<angle> to cover common UNO parser variants.
     controlClient.sendRawLine(String(targetAngle));
     controlClient.sendRawLine(`A${targetAngle}`);

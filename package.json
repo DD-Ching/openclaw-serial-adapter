@@ -65,6 +65,7 @@
     "plugins/openclaw_ts_bridge/*.json",
     "plugins/openclaw_ts_bridge/README.md",
     "plugins/algorithm_blocks_ts/dist/",
+    "firmware/",
     "python/*.py",
     "scripts/",
     "openclaw.plugin.json",

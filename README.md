@@ -291,6 +291,29 @@ When user asks "can you detect IMU now?", do not ask back.
 Call serial_quickcheck immediately and return diagnosis/next_step.
 ```
 
+## If `serial_stop` Is Not Verified
+
+If `serial_stop` returns `verification.verified=false` and the motor keeps moving, your board firmware is likely running an autonomous loop and ignoring runtime serial commands.
+
+Use the provided reference firmware:
+
+- `firmware/uno_mpu6050_servo_runtime/uno_mpu6050_servo_runtime.ino`
+- Board: `Arduino Uno`
+- Baud: `115200`
+
+Behavior of this firmware:
+
+- Power-up default is `hold` (no automatic sweep).
+- Supports `STOP`, `SWEEP_OFF`, `A90`, `90`, `P1500`.
+- Emits JSON telemetry with `ax/ay/az/gx/gy/gz/servo`.
+
+After flashing, run:
+
+```text
+serial_quickcheck(observeMs=1200)
+serial_stop(targetAngle=90, verifyMs=1200)
+```
+
 ## Prototype Status
 
 - Current implementation is closer to your **Prototype B** baseline:
