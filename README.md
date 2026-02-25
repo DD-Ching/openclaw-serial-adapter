@@ -14,6 +14,8 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - TCP telemetry stream (read-only broadcast, default `9000`)
 - TCP control channel (command ingress, default `9001`, with optional ACK response)
 - Auto serial-port probing with best-effort UNO/USB-serial matching
+- Self-healing bridge sync (`serial_bridge_sync`) for auto-connect + auto-resume flows
+- Sticky bridge session semantics: tools reuse the same live bridge session instead of restarting on every command
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
 - Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
@@ -73,6 +75,11 @@ node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/co
 ```bash
 node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
 ```
+
+Bridge stability rule (important):
+- Once connected, tools keep using the same bridge session.
+- If a TCP channel drops, plugin re-attaches channel first (without restarting subprocess/COM) and only restarts as last resort.
+- Check session continuity from tool responses: `bridge.session.session_id`.
 
 5. Optional UNO MVP control channel (if you use plain servo angle line protocol):
 
@@ -212,7 +219,10 @@ Add to your OpenClaw config (`openclaw.json`):
           "baudrate": 115200,
           "telemetryPort": 9000,
           "controlPort": 9001,
-          "host": "127.0.0.1"
+          "host": "127.0.0.1",
+          "toolAutoConnect": true,
+          "autoResumeOnUse": true,
+          "bridgeAckTimeoutMs": 1200
         }
       }
     }
@@ -235,6 +245,9 @@ Add to your OpenClaw config (`openclaw.json`):
 | `unsafePassthrough` | boolean | `false` | Allow all control keys |
 | `allowedCommands` | string[] | `["motor_pwm", "target_velocity"]` | Command allowlist |
 | `maxControlRate` | number | `50` | Max control commands per second |
+| `toolAutoConnect` | boolean | `true` | Let tools auto-connect when disconnected |
+| `autoResumeOnUse` | boolean | `true` | Let tools auto-resume runtime when serial is paused |
+| `bridgeAckTimeoutMs` | number | `1200` | ACK timeout for runtime control/status commands |
 
 ## Registered Tools
 
@@ -242,6 +255,8 @@ Add to your OpenClaw config (`openclaw.json`):
 |---|---|
 | `serial_probe` | List detected serial ports and suggest the best candidate |
 | `serial_connect` | Connect to serial device and start adapter |
+| `serial_intent` | Natural-language intent control (left/right/stop/nod/status) |
+| `serial_bridge_sync` | Ensure bridge is connected/resumed and return runtime status |
 | `serial_quickcheck` | One-shot check: auto-connect (optional) + sample telemetry + IMU detection |
 | `serial_poll` | Read telemetry with compact summary (`includeFrames=true` for raw debug) |
 | `serial_send` | Send a control command to serial device |
@@ -255,37 +270,51 @@ Add to your OpenClaw config (`openclaw.json`):
 
 Use prompts like these with your OpenClaw agent:
 
-1. Connect and detect IMU in one shot:
+1. Stable bridge handshake (recommended first step):
+```text
+Run serial_bridge_sync with autoConnect true, autoResume true.
+Return bridge status, runtime_status.degraded, and telemetry_summary only.
+```
+
+2. Conversation-native intent control (Telegram style):
+```text
+When user says things like "往左一點", "往右一點", "停下來", "點點頭", "看一下狀態",
+call serial_intent with instruction set to the original sentence.
+Do not ask for Arduino syntax unless serial_intent returns intent_unrecognized.
+Return brief action + verification summary.
+```
+
+3. Connect and detect IMU in one shot:
 ```text
 Run serial_quickcheck with observeMs 1500.
 If disconnected, autoConnect should be true.
 Return only summary and whether IMU (ax/ay/az or gx/gy/gz) is detected.
 ```
 
-2. Servo sweep test (visible frequency / PWM change):
+4. Servo sweep test (visible frequency / PWM change):
 ```text
 Send motor_pwm commands in steps: 1200, 1400, 1600, 1700.
 Wait 2 seconds between each step.
 After each step, call serial_poll and summarize latest telemetry.
 ```
 
-2b. Raw servo shorthand (MVP):
+5. Raw servo shorthand (MVP):
 ```text
 Use serial_send with command "90" (or "A90"), then call serial_status.
 ```
 
-3. Safe stop (verified):
+6. Safe stop (verified):
 ```text
 Call serial_stop with targetAngle 90 and verifyMs 1200.
 If verification.verified is false/null, report "command sent but not verified" (do not claim stopped).
 ```
 
-4. Run template motion directly:
+7. Run template motion directly:
 ```text
 Run serial_motion_template with template "slow_sway", repeats 2, intervalMs 400.
 ```
 
-5. LLM behavior guard (avoid "ask-back loop"):
+8. LLM behavior guard (avoid "ask-back loop"):
 ```text
 When user asks "can you detect IMU now?", do not ask back.
 Call serial_quickcheck immediately and return diagnosis/next_step.

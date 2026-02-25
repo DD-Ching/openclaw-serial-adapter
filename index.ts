@@ -7,6 +7,7 @@ import {
   chooseBestSerialPort,
 } from "./src/launcher.js";
 import { TelemetryClient, ControlClient } from "./src/tcp-client.js";
+import type { ControlAckPayload } from "./src/tcp-client.js";
 import type { PluginConfig, TelemetryFrame } from "./src/types.js";
 
 export type {
@@ -21,6 +22,9 @@ let launcher: PythonLauncher | null = null;
 let telemetryClient: TelemetryClient | null = null;
 let controlClient: ControlClient | null = null;
 let log: OpenClawPluginApi["logger"];
+let bridgeSessionId = 0;
+let bridgeSessionStartedAtMs: number | null = null;
+let bridgeReconnectCount = 0;
 
 const MOTION_TEMPLATES = [
   "slow_sway",
@@ -35,6 +39,29 @@ const DEFAULT_POLL_COUNT = 20;
 const DEFAULT_OBSERVE_MS = 1200;
 const DEFAULT_OBSERVE_MAX_FRAMES = 80;
 const STOP_TARGET_DEFAULT = 90;
+const DEFAULT_SEMANTIC_VERIFY_MS = 1000;
+const DEFAULT_ACK_TIMEOUT_MS = 1200;
+const DEFAULT_TOOL_AUTO_CONNECT = true;
+const DEFAULT_AUTO_RESUME_ON_USE = true;
+
+type SemanticIntensity = "small" | "medium" | "large";
+type SemanticIntent =
+  | "status"
+  | "stop"
+  | "center"
+  | "nudge_left"
+  | "nudge_right"
+  | "nod"
+  | "shake"
+  | "unknown";
+
+const INTENSITY_TO_DELTA: Record<SemanticIntensity, number> = {
+  small: 8,
+  medium: 15,
+  large: 25,
+};
+
+let connectInFlight: Promise<void> | null = null;
 
 interface StopVerification {
   verified: boolean | null;
@@ -45,6 +72,25 @@ interface StopVerification {
   target_angle?: number;
   last_motor_pwm?: number;
   motor_pwm_range?: number;
+}
+
+interface BridgeEnsureOptions {
+  autoConnect?: boolean;
+  autoResume?: boolean;
+  port?: string;
+  baudrate?: number;
+  portHints?: string[];
+}
+
+interface BridgeEnsureResult {
+  connected: boolean;
+  auto_connected: boolean;
+  resumed: boolean;
+  serial_port: string | null;
+  runtime_status: Record<string, unknown> | null;
+  bridge_session: Record<string, unknown>;
+  error?: string;
+  next_step?: string;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -58,6 +104,252 @@ function clamp(value: number, min: number, max: number): number {
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   return String(error);
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function isBridgeConnected(): boolean {
+  return Boolean(
+    launcher?.isRunning() &&
+      telemetryClient?.isConnected() &&
+      controlClient?.isConnected()
+  );
+}
+
+function resolveToolAutoConnect(
+  config: PluginConfig,
+  override?: boolean
+): boolean {
+  if (typeof override === "boolean") return override;
+  if (typeof config.toolAutoConnect === "boolean") return config.toolAutoConnect;
+  return DEFAULT_TOOL_AUTO_CONNECT;
+}
+
+function resolveAutoResumeOnUse(
+  config: PluginConfig,
+  override?: boolean
+): boolean {
+  if (typeof override === "boolean") return override;
+  if (typeof config.autoResumeOnUse === "boolean") return config.autoResumeOnUse;
+  return DEFAULT_AUTO_RESUME_ON_USE;
+}
+
+function resolveAckTimeoutMs(config: PluginConfig): number {
+  const configured = config.bridgeAckTimeoutMs;
+  if (typeof configured === "number" && Number.isFinite(configured)) {
+    return Math.max(100, Math.min(Math.floor(configured), 5000));
+  }
+  return DEFAULT_ACK_TIMEOUT_MS;
+}
+
+function buildDynamicConfig(
+  config: PluginConfig,
+  options: Pick<BridgeEnsureOptions, "port" | "baudrate" | "portHints">
+): PluginConfig {
+  return {
+    ...config,
+    serialPort: options.port ?? config.serialPort,
+    baudrate: options.baudrate ?? config.baudrate,
+    portHints: options.portHints ?? config.portHints,
+    autoDetectSerialPort: config.autoDetectSerialPort ?? true,
+  };
+}
+
+function extractRuntimeStatus(ack: ControlAckPayload | null): Record<string, unknown> | null {
+  const record = asRecord(ack);
+  if (!record) return null;
+  return asRecord(record.status);
+}
+
+function extractRuntimeCapabilities(
+  ack: ControlAckPayload | null
+): Record<string, unknown> | null {
+  const record = asRecord(ack);
+  if (!record) return null;
+  return asRecord(record.capabilities);
+}
+
+async function sendRuntimeCommandWithAck(
+  command: Record<string, unknown>,
+  config: PluginConfig
+): Promise<ControlAckPayload | null> {
+  if (!controlClient) return null;
+  try {
+    return await controlClient.sendCommandWithAck(command, resolveAckTimeoutMs(config));
+  } catch {
+    return null;
+  }
+}
+
+async function requestRuntimeStatus(
+  config: PluginConfig
+): Promise<Record<string, unknown> | null> {
+  const ack = await sendRuntimeCommandWithAck({ __adapter_cmd: "status" }, config);
+  return extractRuntimeStatus(ack);
+}
+
+async function requestRuntimeCapabilities(
+  config: PluginConfig
+): Promise<Record<string, unknown> | null> {
+  const ack = await sendRuntimeCommandWithAck(
+    { __adapter_cmd: "capabilities" },
+    config
+  );
+  return extractRuntimeCapabilities(ack);
+}
+
+function getBridgeSessionState(): Record<string, unknown> {
+  return {
+    session_id: bridgeSessionId,
+    session_started_at_ms: bridgeSessionStartedAtMs,
+    reconnect_count: bridgeReconnectCount,
+  };
+}
+
+function markNewBridgeSession(): void {
+  bridgeSessionId += 1;
+  bridgeReconnectCount += 1;
+  bridgeSessionStartedAtMs = Date.now();
+}
+
+async function attachAdapterChannels(
+  config: PluginConfig,
+  ready: { telemetry_port: number; control_port: number }
+): Promise<void> {
+  const host = config.host ?? "127.0.0.1";
+
+  telemetryClient?.disconnect();
+  telemetryClient = null;
+  controlClient?.disconnect();
+  controlClient = null;
+
+  const nextTelemetry = new TelemetryClient();
+  const nextControl = new ControlClient();
+  try {
+    await nextTelemetry.connect(host, ready.telemetry_port);
+    await nextControl.connect(host, ready.control_port);
+  } catch (error) {
+    nextTelemetry.disconnect();
+    nextControl.disconnect();
+    throw new Error(
+      [
+        "Adapter subprocess is running, but channel re-attach failed.",
+        toErrorMessage(error),
+      ].join(" ")
+    );
+  }
+
+  telemetryClient = nextTelemetry;
+  controlClient = nextControl;
+}
+
+async function ensureBridgeReady(
+  config: PluginConfig,
+  options: BridgeEnsureOptions = {}
+): Promise<BridgeEnsureResult> {
+  const autoConnect = resolveToolAutoConnect(config, options.autoConnect);
+  const autoResume = resolveAutoResumeOnUse(config, options.autoResume);
+  const dynamicConfig = buildDynamicConfig(config, options);
+  let autoConnected = false;
+  let resumed = false;
+
+  if (!isBridgeConnected()) {
+    if (!autoConnect) {
+      return {
+        connected: false,
+        auto_connected: false,
+        resumed: false,
+        serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+        runtime_status: null,
+        bridge_session: getBridgeSessionState(),
+        error: "Not connected and autoConnect is disabled.",
+        next_step: "Call serial_connect or enable toolAutoConnect.",
+      };
+    }
+
+    const connectTask = async () => {
+      if (launcher?.isRunning()) {
+        const ready = launcher.getReadyMessage();
+        if (ready) {
+          await attachAdapterChannels(dynamicConfig, ready);
+          return;
+        }
+
+        await disconnectAdapter();
+      }
+      await connectAdapter(dynamicConfig);
+    };
+
+    if (connectInFlight) {
+      try {
+        await connectInFlight;
+      } catch (error) {
+        return {
+          connected: false,
+          auto_connected: false,
+          resumed: false,
+          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          runtime_status: null,
+          bridge_session: getBridgeSessionState(),
+          error: toErrorMessage(error),
+          next_step:
+            "Run serial_probe, close Arduino Serial Monitor/uploader on the same COM, then retry.",
+        };
+      }
+    } else {
+      connectInFlight = connectTask().finally(() => {
+        if (connectInFlight) connectInFlight = null;
+      });
+      try {
+        await connectInFlight;
+      } catch (error) {
+        return {
+          connected: false,
+          auto_connected: false,
+          resumed: false,
+          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          runtime_status: null,
+          bridge_session: getBridgeSessionState(),
+          error: toErrorMessage(error),
+          next_step:
+            "Run serial_probe, close Arduino Serial Monitor/uploader on the same COM, then retry.",
+        };
+      }
+    }
+    autoConnected = true;
+  }
+
+  if (!isBridgeConnected()) {
+    return {
+      connected: false,
+      auto_connected: autoConnected,
+      resumed: false,
+      serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+      runtime_status: null,
+      bridge_session: getBridgeSessionState(),
+      error: "Adapter is not connected (missing telemetry/control channel).",
+      next_step: "Call serial_connect and verify adapter startup logs.",
+    };
+  }
+
+  let runtimeStatus = await requestRuntimeStatus(dynamicConfig);
+  if (autoResume && runtimeStatus?.serial_paused === true) {
+    await sendRuntimeCommandWithAck({ __adapter_cmd: "resume" }, dynamicConfig);
+    resumed = true;
+    runtimeStatus = await requestRuntimeStatus(dynamicConfig);
+  }
+
+  return {
+    connected: true,
+    auto_connected: autoConnected,
+    resumed,
+    serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+    runtime_status: runtimeStatus,
+    bridge_session: getBridgeSessionState(),
+  };
 }
 
 type NormalizedSerialCommand =
@@ -191,6 +483,92 @@ function readNumericField(frame: TelemetryFrame, key: string): number | null {
   if (top !== null) return top;
   const parsed = getParsedRecord(frame);
   return asFiniteNumber(parsed[key]);
+}
+
+function normalizeIntentText(input: string): string {
+  return input.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function includesAny(text: string, keywords: readonly string[]): boolean {
+  return keywords.some((keyword) => text.includes(keyword));
+}
+
+function parseSemanticIntensity(
+  text: string,
+  override?: SemanticIntensity
+): SemanticIntensity {
+  if (override) return override;
+
+  const smallKeywords = ["一點", "一點點", "微", "稍微", "小", "slight", "little"];
+  if (includesAny(text, smallKeywords)) return "small";
+
+  const largeKeywords = ["很多", "大幅", "大一點", "強", "快一點", "more", "larger", "faster"];
+  if (includesAny(text, largeKeywords)) return "large";
+
+  return "medium";
+}
+
+function parseDeltaOverride(text: string, explicitDelta?: number): number | null {
+  if (typeof explicitDelta === "number" && Number.isFinite(explicitDelta)) {
+    return Math.max(1, Math.min(Math.floor(Math.abs(explicitDelta)), 60));
+  }
+
+  const match = text.match(/(-?\d{1,3})\s*(?:deg|degree|度)?/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed)) return null;
+  const safe = Math.max(1, Math.min(Math.floor(Math.abs(parsed)), 60));
+  return safe;
+}
+
+function parseAbsoluteAngle(text: string, explicitAngle?: number): number | null {
+  if (typeof explicitAngle === "number" && Number.isFinite(explicitAngle)) {
+    return clamp(Math.round(explicitAngle), 0, 180);
+  }
+  const absoluteHints = ["到", "設", "set", "angle", "角度", "position", "pos"];
+  if (!includesAny(text, absoluteHints)) return null;
+
+  const match = text.match(/(-?\d{1,3})\s*(?:deg|degree|度)?/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed)) return null;
+  return clamp(Math.round(parsed), 0, 180);
+}
+
+function detectSemanticIntent(input: string): SemanticIntent {
+  const text = normalizeIntentText(input);
+
+  if (!text) return "unknown";
+
+  if (includesAny(text, ["狀態", "觀測", "觀察", "summary", "status", "imu", "偵測", "check"])) {
+    return "status";
+  }
+  if (includesAny(text, ["停", "停止", "stop", "靜止", "別動", "hold"])) {
+    return "stop";
+  }
+  if (includesAny(text, ["回中", "置中", "center", "中間"])) {
+    return "center";
+  }
+  if (includesAny(text, ["點頭", "nod"])) {
+    return "nod";
+  }
+  if (includesAny(text, ["搖頭", "shake"])) {
+    return "shake";
+  }
+  if (includesAny(text, ["往左", "左轉", "向左", "left"])) {
+    return "nudge_left";
+  }
+  if (includesAny(text, ["往右", "右轉", "向右", "right"])) {
+    return "nudge_right";
+  }
+  return "unknown";
+}
+
+function resolveServoAngleFromTelemetryFallback(): number {
+  const latest = telemetryClient?.snapshotFrames(1)[0] ?? null;
+  const measured = latest ? readNumericField(latest, "servo") : null;
+  if (measured === null) return STOP_TARGET_DEFAULT;
+  return clamp(Math.round(measured), 0, 180);
 }
 
 function rangeOf(values: number[]): number | null {
@@ -345,6 +723,16 @@ async function sendBestEffortStopSequence(options: {
   }
 }
 
+async function sendServoAngleBestEffort(targetAngle: number): Promise<void> {
+  if (!controlClient) {
+    throw new Error("Not connected. Call serial_connect first.");
+  }
+  const clamped = clamp(Math.round(targetAngle), 0, 180);
+  controlClient.sendRawLine(String(clamped));
+  await sleep(20);
+  controlClient.sendRawLine(`A${clamped}`);
+}
+
 function evaluateStopVerification(
   frames: TelemetryFrame[],
   targetAngle: number
@@ -398,24 +786,139 @@ function evaluateStopVerification(
   };
 }
 
+async function executeSemanticIntent(options: {
+  instruction: string;
+  verifyMs?: number;
+  intensity?: SemanticIntensity;
+  delta?: number;
+  targetAngle?: number;
+  includeFrames?: boolean;
+}): Promise<Record<string, unknown>> {
+  const text = normalizeIntentText(options.instruction);
+  const intent = detectSemanticIntent(text);
+  const verifyMs =
+    typeof options.verifyMs === "number" && Number.isFinite(options.verifyMs)
+      ? Math.max(300, Math.min(Math.floor(options.verifyMs), 8000))
+      : DEFAULT_SEMANTIC_VERIFY_MS;
+  const includeFrames = options.includeFrames === true;
+
+  if (intent === "unknown") {
+    return {
+      status: "intent_unrecognized",
+      intent,
+      instruction: options.instruction,
+      next_step:
+        "Try phrases like: 往左一點 / 往右一點 / 停下來 / 回中 / 點頭 / 搖頭 / 看狀態",
+    };
+  }
+
+  if (intent === "status") {
+    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
+    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    return {
+      status: "ok",
+      intent,
+      action: "observe_only",
+      summary,
+      frames: includeFrames ? frames : undefined,
+    };
+  }
+
+  if (intent === "stop") {
+    await sendBestEffortStopSequence({
+      targetAngle: STOP_TARGET_DEFAULT,
+      repeats: 2,
+      intervalMs: 120,
+    });
+    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
+    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    const verification = evaluateStopVerification(frames, STOP_TARGET_DEFAULT);
+    return {
+      status: "ok",
+      intent,
+      action: "best_effort_stop",
+      target_angle: STOP_TARGET_DEFAULT,
+      verification,
+      summary,
+      frames: includeFrames ? frames : undefined,
+    };
+  }
+
+  if (intent === "center") {
+    const target = parseAbsoluteAngle(text, options.targetAngle) ?? STOP_TARGET_DEFAULT;
+    await sendServoAngleBestEffort(target);
+    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
+    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    const verification = evaluateStopVerification(frames, target);
+    return {
+      status: "ok",
+      intent,
+      action: "set_center",
+      target_angle: target,
+      verification,
+      summary,
+      frames: includeFrames ? frames : undefined,
+    };
+  }
+
+  if (intent === "nudge_left" || intent === "nudge_right") {
+    const current = resolveServoAngleFromTelemetryFallback();
+    const intensity = parseSemanticIntensity(text, options.intensity);
+    const delta = parseDeltaOverride(text, options.delta) ?? INTENSITY_TO_DELTA[intensity];
+    const sign = intent === "nudge_left" ? -1 : 1;
+    const absoluteOverride = parseAbsoluteAngle(text, options.targetAngle);
+    const target =
+      absoluteOverride !== null ? absoluteOverride : clamp(current + sign * delta, 0, 180);
+
+    await sendServoAngleBestEffort(target);
+    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
+    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    const verification = evaluateStopVerification(frames, target);
+    return {
+      status: "ok",
+      intent,
+      action: "nudge_servo",
+      from_angle: current,
+      target_angle: target,
+      delta: Math.abs(target - current),
+      intensity,
+      verification,
+      summary,
+      frames: includeFrames ? frames : undefined,
+    };
+  }
+
+  const sequence =
+    intent === "nod" ? [90, 75, 100, 80, 90] : [90, 70, 110, 75, 105, 90];
+  for (const angle of sequence) {
+    await sendServoAngleBestEffort(angle);
+    await sleep(180);
+  }
+  const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
+  const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+  const verification = evaluateStopVerification(frames, 90);
+  return {
+    status: "ok",
+    intent,
+    action: intent === "nod" ? "motion_nod" : "motion_shake",
+    sequence,
+    verification,
+    summary,
+    frames: includeFrames ? frames : undefined,
+  };
+}
+
 async function connectAdapter(config: PluginConfig) {
   launcher = new PythonLauncher(config);
   const ready = await launcher.start();
+  markNewBridgeSession();
 
-  const host = config.host ?? "127.0.0.1";
   const resolvedPort = launcher.getResolvedPort() ?? config.serialPort ?? null;
   const portInfo = compactPortInfo(resolvedPort, launcher.getLastProbePorts());
 
-  telemetryClient = new TelemetryClient();
-  controlClient = new ControlClient();
   try {
-    await telemetryClient.connect(host, ready.telemetry_port);
-    await controlClient.connect(host, ready.control_port);
+    await attachAdapterChannels(config, ready);
   } catch (error) {
-    telemetryClient?.disconnect();
-    telemetryClient = null;
-    controlClient?.disconnect();
-    controlClient = null;
     await launcher.stop();
     launcher = null;
     throw new Error(
@@ -433,10 +936,12 @@ async function connectAdapter(config: PluginConfig) {
     telemetry_port: ready.telemetry_port,
     control_port: ready.control_port,
     pid: ready.pid,
+    bridge_session: getBridgeSessionState(),
   };
   log.info(
     JSON.stringify({
       event: "serial_adapter_connected",
+      bridge_session: getBridgeSessionState(),
       serial_port: result.serial_port,
       serial_ports_available: result.serial_ports_available,
       telemetry_port: result.telemetry_port,
@@ -457,6 +962,7 @@ async function disconnectAdapter() {
   log.info(
     JSON.stringify({
       event: "serial_adapter_disconnected",
+      bridge_session: getBridgeSessionState(),
     })
   );
 }
@@ -551,10 +1057,6 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        if (launcher?.isRunning()) {
-          return jsonResult({ status: "already_connected" });
-        }
-
         const dynamicConfig: PluginConfig = {
           ...config,
           serialPort: params.port ?? config.serialPort,
@@ -563,6 +1065,39 @@ const plugin = {
             params.autoDetect ?? config.autoDetectSerialPort ?? true,
           portHints: params.portHints ?? config.portHints,
         };
+
+        if (launcher?.isRunning()) {
+          if (isBridgeConnected()) {
+            return jsonResult({
+              status: "already_connected",
+              serial_port: launcher.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+              bridge_session: getBridgeSessionState(),
+            });
+          }
+
+          const ready = launcher.getReadyMessage();
+          if (ready) {
+            try {
+              await attachAdapterChannels(dynamicConfig, ready);
+              return jsonResult({
+                status: "channels_reattached",
+                serial_port: launcher.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+                telemetry_port: ready.telemetry_port,
+                control_port: ready.control_port,
+                bridge_session: getBridgeSessionState(),
+              });
+            } catch (error) {
+              return jsonResult({
+                status: "reattach_failed",
+                error: toErrorMessage(error),
+                next_step:
+                  "Retry serial_connect. If still failing, run serial_bridge_sync or restart gateway.",
+              });
+            }
+          }
+
+          await disconnectAdapter();
+        }
 
         try {
           return jsonResult(await connectAdapter(dynamicConfig));
@@ -577,6 +1112,105 @@ const plugin = {
     });
 
     api.registerTool({
+      name: "serial_intent",
+      label: "Semantic Intent Control",
+      description:
+        "Execute natural-language control intent (for example: 往左一點/往右一點/停下來/點頭/看狀態) without requiring low-level Arduino command syntax.",
+      parameters: Type.Object({
+        instruction: Type.String({
+          description:
+            "Natural language command from user conversation, e.g. '往左一點' or '停下來'.",
+        }),
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
+        verifyMs: Type.Optional(
+          Type.Number({
+            description: "Telemetry verification/observe window in ms (default 1000).",
+            minimum: 300,
+            maximum: 8000,
+          })
+        ),
+        intensity: Type.Optional(
+          Type.Union(
+            [
+              Type.Literal("small"),
+              Type.Literal("medium"),
+              Type.Literal("large"),
+            ],
+            { description: "Optional intent intensity override." }
+          )
+        ),
+        delta: Type.Optional(
+          Type.Number({
+            description: "Optional angle delta override for nudge actions.",
+            minimum: 1,
+            maximum: 60,
+          })
+        ),
+        targetAngle: Type.Optional(
+          Type.Number({
+            description: "Optional absolute servo angle override.",
+            minimum: 0,
+            maximum: 180,
+          })
+        ),
+        includeFrames: Type.Optional(
+          Type.Boolean({
+            description: "Include sampled frames for debug mode.",
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected || !telemetryClient || !controlClient) {
+          return jsonResult({
+            status: "bridge_unavailable",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
+            bridge: {
+              auto_connected: bridge.auto_connected,
+              resumed: bridge.resumed,
+              serial_port: bridge.serial_port,
+              session: bridge.bridge_session,
+            },
+          });
+        }
+
+        const result = await executeSemanticIntent({
+          instruction: params.instruction,
+          verifyMs: params.verifyMs,
+          intensity: params.intensity as SemanticIntensity | undefined,
+          delta: params.delta,
+          targetAngle: params.targetAngle,
+          includeFrames: params.includeFrames,
+        });
+
+        return jsonResult({
+          ...result,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+        });
+      },
+    });
+
+    api.registerTool({
       name: "serial_poll",
       label: "Poll Telemetry",
       description:
@@ -584,6 +1218,18 @@ const plugin = {
       parameters: Type.Object({
         count: Type.Optional(
           Type.Number({ description: "Max number of frames to return (default 20)" })
+        ),
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
         ),
         includeFrames: Type.Optional(
           Type.Boolean({
@@ -593,9 +1239,14 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        if (!telemetryClient) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected || !telemetryClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
         const requestedCount =
@@ -606,9 +1257,28 @@ const plugin = {
         const frames = telemetryClient.pollFrames(requestedCount);
         const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
         if (includeFrames) {
-          return jsonResult({ frames, count: frames.length, summary });
+          return jsonResult({
+            frames,
+            count: frames.length,
+            summary,
+            bridge: {
+              auto_connected: bridge.auto_connected,
+              resumed: bridge.resumed,
+              serial_port: bridge.serial_port,
+              session: bridge.bridge_session,
+            },
+          });
         }
-        return jsonResult({ count: frames.length, summary });
+        return jsonResult({
+          count: frames.length,
+          summary,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+        });
       },
     });
 
@@ -629,6 +1299,15 @@ const plugin = {
         baudrate: Type.Optional(
           Type.Number({ description: "Baud rate override when auto-connect is used." })
         ),
+        portHints: Type.Optional(
+          Type.Array(Type.String({ description: "Port matching hints for auto-connect." }))
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
         observeMs: Type.Optional(
           Type.Number({ description: "Observe window in ms (default 1200)", minimum: 200, maximum: 8000 })
         ),
@@ -646,32 +1325,22 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        const autoConnect = params.autoConnect !== false;
-        if (!launcher?.isRunning()) {
-          if (!autoConnect) {
-            return jsonResult({
-              status: "disconnected",
-              next_step: "Call serial_connect first, then run serial_quickcheck again.",
-            });
-          }
-          const dynamicConfig: PluginConfig = {
-            ...config,
-            serialPort: params.port ?? config.serialPort,
-            baudrate: params.baudrate ?? config.baudrate,
-            autoDetectSerialPort: true,
-          };
-          try {
-            await connectAdapter(dynamicConfig);
-          } catch (error) {
-            return jsonResult({
-              status: "disconnected",
-              error: toErrorMessage(error),
-              next_step:
-                "Run serial_probe, close Arduino Serial Monitor/uploader on the same COM, then retry serial_connect.",
-            });
-          }
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+          port: params.port,
+          baudrate: params.baudrate,
+          portHints: params.portHints,
+        });
+        if (!bridge.connected) {
+          return jsonResult({
+            status: "disconnected",
+            error: bridge.error ?? "Not connected.",
+            next_step:
+              bridge.next_step ??
+              "Run serial_probe, close Arduino Serial Monitor/uploader on the same COM, then retry serial_connect.",
+          });
         }
-
         if (!telemetryClient || !controlClient) {
           return jsonResult({
             status: "degraded",
@@ -702,10 +1371,16 @@ const plugin = {
 
         return jsonResult({
           status: "connected",
-          port: launcher?.getResolvedPort() ?? config.serialPort ?? null,
+          port: bridge.serial_port,
           observe_ms: observeMs,
           sampled_frames: frames.length,
           summary,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            runtime_status: bridge.runtime_status,
+            session: bridge.bridge_session,
+          },
           frames: includeFrames ? frames : undefined,
         });
       },
@@ -716,15 +1391,32 @@ const plugin = {
       label: "Send Command",
       description: "Send a control command to serial device",
       parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
         command: Type.Unknown({
           description:
             "Control payload. Supports JSON object or shorthand text (A90/P1500/90).",
         }),
       }),
       async execute(_toolCallId, params) {
-        if (!controlClient) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected || !controlClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
         const normalized = normalizeSerialSendCommand(params.command);
@@ -746,6 +1438,12 @@ const plugin = {
           mode: normalized.mode,
           source: normalized.source,
           normalized: normalized.payload,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
         });
       },
     });
@@ -756,6 +1454,18 @@ const plugin = {
       description:
         "Best-effort stop sequence (center + zero outputs) with telemetry verification to avoid false 'stopped' claims.",
       parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
         targetAngle: Type.Optional(
           Type.Number({ description: "Servo center target angle (default 90)", minimum: 0, maximum: 180 })
         ),
@@ -773,9 +1483,14 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        if (!controlClient || !telemetryClient) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected || !controlClient || !telemetryClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
 
@@ -822,6 +1537,12 @@ const plugin = {
           repeats,
           interval_ms: intervalMs,
           verify_ms: verifyMs,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
           verification,
           summary,
           frames: includeFrames ? frames : undefined,
@@ -839,6 +1560,18 @@ const plugin = {
       description:
         "Run built-in servo motion templates (slow_sway, fast_jitter, sweep, center_stop)",
       parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
         template: Type.Union(
           MOTION_TEMPLATES.map((name) => Type.Literal(name)),
           { description: "Built-in motion template name" }
@@ -860,9 +1593,14 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        if (!controlClient || !telemetryClient) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected || !controlClient || !telemetryClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
 
@@ -895,6 +1633,12 @@ const plugin = {
             intervalMs,
             sequence,
             totalCommands: sequence.length * repeats,
+            bridge: {
+              auto_connected: bridge.auto_connected,
+              resumed: bridge.resumed,
+              serial_port: bridge.serial_port,
+              session: bridge.bridge_session,
+            },
             verification,
             summary,
             note:
@@ -918,6 +1662,100 @@ const plugin = {
           intervalMs,
           sequence,
           totalCommands: sequence.length * repeats,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "serial_bridge_sync",
+      label: "Bridge Sync",
+      description:
+        "One-shot bridge synchronizer: ensure connected, auto-resume if paused, and return machine-readable runtime status/capabilities.",
+      parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
+        port: Type.Optional(
+          Type.String({
+            description: "Serial port override when auto-connect creates a new session.",
+          })
+        ),
+        baudrate: Type.Optional(
+          Type.Number({
+            description: "Baudrate override when auto-connect creates a new session.",
+          })
+        ),
+        portHints: Type.Optional(
+          Type.Array(Type.String({ description: "Port matching hints for auto-connect." }))
+        ),
+        includeCapabilities: Type.Optional(
+          Type.Boolean({
+            description: "Include runtime capabilities from adapter ACK.",
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+          port: params.port,
+          baudrate: params.baudrate,
+          portHints: params.portHints,
+        });
+
+        if (!bridge.connected) {
+          return jsonResult({
+            status: "disconnected",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
+            bridge: {
+              auto_connected: bridge.auto_connected,
+              resumed: bridge.resumed,
+              serial_port: bridge.serial_port,
+              session: bridge.bridge_session,
+            },
+          });
+        }
+
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const capabilities =
+          params.includeCapabilities === true
+            ? await requestRuntimeCapabilities(config)
+            : undefined;
+        const previewFrames = telemetryClient?.snapshotFrames(DEFAULT_POLL_COUNT) ?? [];
+        const telemetrySummary = summarizeTelemetryFrames(
+          previewFrames,
+          telemetryClient?.bufferedCount() ?? 0
+        );
+
+        return jsonResult({
+          status: "connected",
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+          runtime_status: runtimeStatus,
+          capabilities,
+          telemetry_summary: telemetrySummary,
+          latest_control_ack: controlClient?.getLatestAck() ?? null,
         });
       },
     });
@@ -927,12 +1765,35 @@ const plugin = {
       label: "Adapter Status",
       description:
         "Get adapter runtime status plus a compact snapshot of recent telemetry/IMU visibility",
-      parameters: Type.Object({}),
-      async execute() {
-        if (!launcher?.isRunning()) {
+      parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        autoResume: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto resume when runtime is paused for COM yield (default from autoResumeOnUse).",
+          })
+        ),
+        includeCapabilities: Type.Optional(
+          Type.Boolean({
+            description: "Include runtime capabilities from the Python adapter ACK.",
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: params.autoResume,
+        });
+        if (!bridge.connected) {
           return jsonResult({
             status: "disconnected",
-            next_step: "Call serial_connect, then serial_quickcheck.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect, then serial_quickcheck.",
           });
         }
         const previewFrames = telemetryClient?.snapshotFrames(DEFAULT_POLL_COUNT) ?? [];
@@ -940,10 +1801,24 @@ const plugin = {
           previewFrames,
           telemetryClient?.bufferedCount() ?? 0
         );
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const capabilities =
+          params.includeCapabilities === true
+            ? await requestRuntimeCapabilities(config)
+            : undefined;
         return jsonResult({
           status: "connected",
-          port: launcher.getResolvedPort() ?? config.serialPort ?? null,
-          ready: launcher.getReadyMessage(),
+          port: bridge.serial_port,
+          ready: launcher?.getReadyMessage() ?? null,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            session: bridge.bridge_session,
+          },
+          runtime_status: runtimeStatus,
+          capabilities,
+          latest_control_ack: controlClient?.getLatestAck() ?? null,
           telemetry_summary: summary,
         });
       },
@@ -955,6 +1830,12 @@ const plugin = {
       description:
         "Temporarily release COM for firmware upload (adapter stays alive)",
       parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
         seconds: Type.Optional(
           Type.Number({
             description: "Pause duration seconds (default 25, 0 = manual resume)",
@@ -963,22 +1844,38 @@ const plugin = {
         ),
       }),
       async execute(_toolCallId, params) {
-        if (!controlClient) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: false,
+        });
+        if (!bridge.connected || !controlClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
         const holdS =
           typeof params.seconds === "number"
             ? Math.max(0, Math.min(params.seconds, 300))
             : 25;
-        controlClient.sendCommand({
+        const ack = await sendRuntimeCommandWithAck(
+          {
           __adapter_cmd: "pause",
           hold_s: holdS > 0 ? holdS : undefined,
-        });
+          },
+          config
+        );
         return jsonResult({
           status: "pause_requested",
           hold_s: holdS > 0 ? holdS : null,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+          runtime_ack: ack,
+          runtime_status: extractRuntimeStatus(ack),
         });
       },
     });
@@ -987,15 +1884,40 @@ const plugin = {
       name: "serial_resume",
       label: "Resume Serial",
       description: "Re-open COM after upload",
-      parameters: Type.Object({}),
-      async execute() {
-        if (!controlClient) {
+      parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: false,
+        });
+        if (!bridge.connected || !controlClient) {
           return jsonResult({
-            error: "Not connected. Call serial_connect first.",
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
           });
         }
-        controlClient.sendCommand({ __adapter_cmd: "resume" });
-        return jsonResult({ status: "resume_requested" });
+        const ack = await sendRuntimeCommandWithAck(
+          { __adapter_cmd: "resume" },
+          config
+        );
+        return jsonResult({
+          status: "resume_requested",
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+          runtime_ack: ack,
+          runtime_status: extractRuntimeStatus(ack),
+        });
       },
     });
   },
