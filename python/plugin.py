@@ -294,9 +294,7 @@ class SerialAdapter:
         with self._state_lock:
             self._serial_paused = True
             self._pause_until_monotonic = (
-                time.monotonic() + hold_seconds
-                if hold_seconds is not None
-                else None
+                time.monotonic() + hold_seconds if hold_seconds is not None else None
             )
             self._next_reopen_monotonic = 0.0
 
@@ -358,7 +356,8 @@ class SerialAdapter:
         with self._control_lock:
             self._expire_control_lease_locked(now)
             if self._control_lease_owner is not None:
-                # Do not inject probe traffic while an external control source holds the lane.
+                # Do not inject probe traffic while an external control source
+                # holds the lane.
                 return False
         with self._status_lock:
             if now - self._last_probe_monotonic < AUTO_PROBE_MIN_GAP_S:
@@ -378,7 +377,9 @@ class SerialAdapter:
             return False
 
         with self._status_lock:
-            line = AUTO_PROBE_SEQUENCE[self._next_probe_index % len(AUTO_PROBE_SEQUENCE)]
+            line = AUTO_PROBE_SEQUENCE[
+                self._next_probe_index % len(AUTO_PROBE_SEQUENCE)
+            ]
             self._next_probe_index = (self._next_probe_index + 1) % len(
                 AUTO_PROBE_SEQUENCE
             )
@@ -818,53 +819,77 @@ class SerialAdapter:
 
             if source_id is None:
                 if current_owner is None:
-                    return True, "no_source", {
-                        "owner": None,
-                        "priority": 0,
-                        "remaining_s": None,
-                    }
-                return False, "lease_held_by_other", {
-                    "owner": current_owner,
-                    "priority": current_priority,
-                    "remaining_s": max(0.0, current_expires - now),
-                }
+                    return (
+                        True,
+                        "no_source",
+                        {
+                            "owner": None,
+                            "priority": 0,
+                            "remaining_s": None,
+                        },
+                    )
+                return (
+                    False,
+                    "lease_held_by_other",
+                    {
+                        "owner": current_owner,
+                        "priority": current_priority,
+                        "remaining_s": max(0.0, current_expires - now),
+                    },
+                )
 
             if current_owner is None:
                 self._control_lease_owner = source_id
                 self._control_lease_priority = priority
                 self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
-                return True, "lease_acquired", {
-                    "owner": source_id,
-                    "priority": priority,
-                    "remaining_s": lease_ms / 1000.0,
-                }
+                return (
+                    True,
+                    "lease_acquired",
+                    {
+                        "owner": source_id,
+                        "priority": priority,
+                        "remaining_s": lease_ms / 1000.0,
+                    },
+                )
 
             if current_owner == source_id:
                 # Same source refreshes lease.
                 self._control_lease_priority = max(current_priority, priority)
                 self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
-                return True, "lease_refreshed", {
-                    "owner": source_id,
-                    "priority": self._control_lease_priority,
-                    "remaining_s": lease_ms / 1000.0,
-                }
+                return (
+                    True,
+                    "lease_refreshed",
+                    {
+                        "owner": source_id,
+                        "priority": self._control_lease_priority,
+                        "remaining_s": lease_ms / 1000.0,
+                    },
+                )
 
             if priority > current_priority:
                 # Higher priority source can preempt.
                 self._control_lease_owner = source_id
                 self._control_lease_priority = priority
                 self._control_lease_expires_monotonic = now + (lease_ms / 1000.0)
-                return True, "lease_preempted", {
-                    "owner": source_id,
-                    "priority": priority,
-                    "remaining_s": lease_ms / 1000.0,
-                }
+                return (
+                    True,
+                    "lease_preempted",
+                    {
+                        "owner": source_id,
+                        "priority": priority,
+                        "remaining_s": lease_ms / 1000.0,
+                    },
+                )
 
-            return False, "lease_held_by_other", {
-                "owner": current_owner,
-                "priority": current_priority,
-                "remaining_s": max(0.0, current_expires - now),
-            }
+            return (
+                False,
+                "lease_held_by_other",
+                {
+                    "owner": current_owner,
+                    "priority": current_priority,
+                    "remaining_s": max(0.0, current_expires - now),
+                },
+            )
 
     def _convert_servo_alias_to_raw_line(
         self, command: Dict[str, Any]
@@ -1351,7 +1376,9 @@ class SerialAdapter:
                     "idle_interval_s": float(AUTO_PROBE_IDLE_INTERVAL_S),
                     "min_gap_s": float(AUTO_PROBE_MIN_GAP_S),
                     "max_backoff_s": float(AUTO_PROBE_MAX_BACKOFF_S),
-                    "purpose": "wake telemetry streaming firmware and reduce manual retries",
+                    "purpose": (
+                        "wake telemetry streaming firmware and reduce manual retries"
+                    ),
                 },
             },
             "control": {
@@ -1369,7 +1396,8 @@ class SerialAdapter:
                     "priority_range": [-100, 100],
                     "behavior": (
                         "Commands with source_id acquire/refresh lease;"
-                        " higher priority can preempt; anonymous commands are blocked while lease is active."
+                        " higher priority can preempt;"
+                        " anonymous commands are blocked while lease is active."
                     ),
                 },
                 "raw_line_protocol": {
