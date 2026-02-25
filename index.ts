@@ -41,6 +41,13 @@ const DEFAULT_OBSERVE_MAX_FRAMES = 80;
 const STOP_TARGET_DEFAULT = 90;
 const DEFAULT_SEMANTIC_VERIFY_MS = 1000;
 const DEFAULT_SEMANTIC_SOURCE_ID = "serial_intent";
+const AUTO_PROBE_SEQUENCE = [
+  "STATUS?",
+  "IMU_ON",
+  "TELEMETRY_ON",
+  "STREAM_ON",
+  "IMU?",
+] as const;
 const DEFAULT_ACK_TIMEOUT_MS = 1200;
 const DEFAULT_TOOL_AUTO_CONNECT = true;
 const DEFAULT_AUTO_RESUME_ON_USE = true;
@@ -778,6 +785,24 @@ function sendManagedJsonCommand(
   });
 }
 
+async function sendProbeBurst(options?: {
+  source?: ControlSourceContext;
+  spacingMs?: number;
+  lines?: readonly string[];
+}): Promise<void> {
+  const lines = options?.lines?.length ? options.lines : AUTO_PROBE_SEQUENCE;
+  const spacingMs =
+    typeof options?.spacingMs === "number" && Number.isFinite(options.spacingMs)
+      ? Math.max(0, Math.min(Math.floor(options.spacingMs), 500))
+      : 60;
+  for (const line of lines) {
+    sendManagedRawLine(String(line), options?.source);
+    if (spacingMs > 0) {
+      await sleep(spacingMs);
+    }
+  }
+}
+
 async function sendBestEffortStopSequence(options: {
   targetAngle: number;
   repeats: number;
@@ -1446,11 +1471,43 @@ const plugin = {
         triggerProbe: Type.Optional(
           Type.Boolean({
             description:
-              "Send probe raw commands (IMU?/STATUS?) before observing, useful when firmware is idle.",
+              "Send handshake probe sequence (STATUS?/IMU_ON/TELEMETRY_ON/STREAM_ON/IMU?) before observing.",
           })
         ),
         includeFrames: Type.Optional(
           Type.Boolean({ description: "Include sampled frames for debug." })
+        ),
+        driveAngle: Type.Optional(
+          Type.Number({
+            description:
+              "Optional servo angle drive test before observe (0..180).",
+            minimum: 0,
+            maximum: 180,
+          })
+        ),
+        sourceId: Type.Optional(
+          Type.String({
+            description:
+              "Optional control source id for probe/drive lease.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        priority: Type.Optional(
+          Type.Number({
+            description:
+              "Optional arbitration priority (-100..100) for probe/drive lease.",
+            minimum: -100,
+            maximum: 100,
+          })
+        ),
+        leaseMs: Type.Optional(
+          Type.Number({
+            description:
+              "Optional lease time in ms for probe/drive lease (200..120000).",
+            minimum: 200,
+            maximum: 120000,
+          })
         ),
       }),
       async execute(_toolCallId, params) {
@@ -1477,15 +1534,6 @@ const plugin = {
           });
         }
 
-        if (params.triggerProbe !== false) {
-          try {
-            controlClient.sendRawLine("IMU?");
-            controlClient.sendRawLine("STATUS?");
-          } catch {
-            // Probe is best-effort only.
-          }
-        }
-
         const observeMs =
           typeof params.observeMs === "number"
             ? Math.max(200, Math.min(Math.floor(params.observeMs), 8000))
@@ -1494,6 +1542,42 @@ const plugin = {
           typeof params.maxFrames === "number"
             ? Math.max(1, Math.min(Math.floor(params.maxFrames), 400))
             : DEFAULT_OBSERVE_MAX_FRAMES;
+        const source = toControlSourceContext(
+          {
+            sourceId: params.sourceId,
+            priority: params.priority,
+            leaseMs: params.leaseMs,
+          },
+          {
+            sourceId: "serial_quickcheck",
+            priority: 10,
+            leaseMs: observeMs + 1500,
+          }
+        );
+        let driveAction: Record<string, unknown> | null = null;
+
+        if (params.triggerProbe !== false) {
+          try {
+            await sendProbeBurst({ source, spacingMs: 60 });
+          } catch {
+            // Probe is best-effort only.
+          }
+        }
+
+        if (typeof params.driveAngle === "number" && Number.isFinite(params.driveAngle)) {
+          const target = clamp(Math.round(params.driveAngle), 0, 180);
+          try {
+            await sendServoAngleBestEffort(target, source);
+            driveAction = { requested: target, sent: true };
+          } catch (error) {
+            driveAction = {
+              requested: target,
+              sent: false,
+              error: toErrorMessage(error),
+            };
+          }
+        }
+
         const frames = await collectTelemetryFrames(observeMs, maxFrames);
         const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
         const includeFrames = params.includeFrames === true;
@@ -1504,6 +1588,8 @@ const plugin = {
           observe_ms: observeMs,
           sampled_frames: frames.length,
           summary,
+          drive_action: driveAction,
+          control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,

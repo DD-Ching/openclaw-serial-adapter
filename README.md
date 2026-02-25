@@ -17,6 +17,7 @@ The TypeScript plugin spawns a Python subprocess that handles serial I/O and TCP
 - Self-healing bridge sync (`serial_bridge_sync`) for auto-connect + auto-resume flows
 - Sticky bridge session semantics: tools reuse the same live bridge session instead of restarting on every command
 - Multi-source control arbitration lease (`source_id` + `priority` + `lease_ms`) to avoid command collisions
+- Runtime auto-probe handshake (`STATUS?`, `IMU_ON`, `TELEMETRY_ON`, `STREAM_ON`, `IMU?`) to reduce “connected but no telemetry” loops
 - Observer API (`poll`, `poll_all`, `register_callback`, `get_latest_frame`, `get_last_n_frames`)
 - Control safety enforcement (`unsafe_passthrough`, allowlist, rate limiting)
 - Built-in motion templates (`slow_sway`, `fast_jitter`, `sweep`, `center_stop`)
@@ -59,6 +60,12 @@ macOS/Linux:
 node scripts/quick_self_check.js --json
 ```
 
+If `openclaw_extension.up_to_date=false`, refresh your installed extension:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/deploy_local_extension.ps1 -RestartGateway
+```
+
 2. Start OpenClaw gateway:
 
 ```bash
@@ -71,7 +78,13 @@ openclaw gateway start
 node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/config.json
 ```
 
-4. Send low-rate control command and read machine-readable ACK:
+4. Strict hardware E2E gate (handshake -> observe -> drive):
+
+```bash
+python scripts/hardware_e2e_check.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --observe-s 2.5 --drive-angle 90
+```
+
+5. Send low-rate control command and read machine-readable ACK:
 
 ```bash
 node plugins/openclaw_ts_bridge/send_llm_command.js --cmd set --target servo_pos --value 90
@@ -82,7 +95,7 @@ Bridge stability rule (important):
 - If a TCP channel drops, plugin re-attaches channel first (without restarting subprocess/COM) and only restarts as last resort.
 - Check session continuity from tool responses: `bridge.session.session_id`.
 
-5. Optional UNO MVP control channel (if you use plain servo angle line protocol):
+6. Optional UNO MVP control channel (if you use plain servo angle line protocol):
 
 ```bash
 node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
@@ -292,6 +305,12 @@ If disconnected, autoConnect should be true.
 Return only summary and whether IMU (ax/ay/az or gx/gy/gz) is detected.
 ```
 
+3b. Connect + probe + drive test in one shot:
+```text
+Run serial_quickcheck with observeMs 1500, driveAngle 90, triggerProbe true.
+Return summary, drive_action, and diagnosis.
+```
+
 4. Servo sweep test (visible frequency / PWM change):
 ```text
 Send motor_pwm commands in steps: 1200, 1400, 1600, 1700.
@@ -378,6 +397,7 @@ Current tool defaults:
 - `serial_intent` uses `source_id=serial_intent` by default.
 - `serial_stop` and `serial_motion_template` also attach a default source lease.
 - `serial_send` supports optional `sourceId/priority/leaseMs` when you need explicit ownership.
+- `serial_quickcheck` also supports `sourceId/priority/leaseMs` and can include `driveAngle`.
 
 ## Development
 

@@ -85,6 +85,16 @@ DEFAULT_CONTROL_LEASE_MS = 5000
 MIN_CONTROL_LEASE_MS = 200
 MAX_CONTROL_LEASE_MS = 120000
 
+AUTO_PROBE_SEQUENCE: tuple[str, ...] = (
+    "STATUS?",
+    "IMU_ON",
+    "TELEMETRY_ON",
+    "STREAM_ON",
+    "IMU?",
+)
+AUTO_PROBE_IDLE_INTERVAL_S = 1.5
+AUTO_PROBE_MIN_GAP_S = 0.35
+
 
 class SerialAdapter:
     """Universal Telemetry Adapter v3: serial transport + TCP observer transport."""
@@ -127,6 +137,12 @@ class SerialAdapter:
         self._control_lease_owner: Optional[str] = None
         self._control_lease_priority = 0
         self._control_lease_expires_monotonic = 0.0
+        self._last_rx_monotonic = 0.0
+        self._last_probe_monotonic = 0.0
+        self._last_probe_line: Optional[str] = None
+        self._last_probe_reason: Optional[str] = None
+        self._probe_sent_count = 0
+        self._next_probe_index = 0
 
         self._serial: Optional[Any] = None
         self._serial_reopen_interval_s = float(DEFAULT_REOPEN_INTERVAL_S)
@@ -209,6 +225,12 @@ class SerialAdapter:
             self._control_commands_rejected = 0
             self._control_commands_queued = 0
             self._queued_control_dropped = 0
+            self._last_rx_monotonic = 0.0
+            self._last_probe_monotonic = 0.0
+            self._last_probe_line = None
+            self._last_probe_reason = None
+            self._probe_sent_count = 0
+            self._next_probe_index = 0
         with self._queue_lock:
             self._queued_control.clear()
         with self._frame_lock:
@@ -306,6 +328,7 @@ class SerialAdapter:
                 self._serial_reconnect_attempts = 0
                 self._serial_last_error = None
             self._ring_buffer.clear()
+            self._send_next_auto_probe(reason="reopen", force=True)
             return True
 
         with self._state_lock:
@@ -323,6 +346,43 @@ class SerialAdapter:
         self._ring_buffer.clear()
         self._close_serial_transport()
 
+    def _should_send_auto_probe(self, *, force: bool) -> bool:
+        if force:
+            return True
+        now = time.monotonic()
+        with self._status_lock:
+            if now - self._last_probe_monotonic < AUTO_PROBE_MIN_GAP_S:
+                return False
+            if self._last_rx_monotonic <= 0.0:
+                return True
+            return (now - self._last_rx_monotonic) >= AUTO_PROBE_IDLE_INTERVAL_S
+
+    def _send_next_auto_probe(self, *, reason: str, force: bool = False) -> bool:
+        if not AUTO_PROBE_SEQUENCE:
+            return False
+        if not self._should_send_auto_probe(force=force):
+            return False
+
+        with self._status_lock:
+            line = AUTO_PROBE_SEQUENCE[self._next_probe_index % len(AUTO_PROBE_SEQUENCE)]
+            self._next_probe_index = (self._next_probe_index + 1) % len(
+                AUTO_PROBE_SEQUENCE
+            )
+
+        try:
+            self.write_raw_line(line)
+        except Exception as exc:
+            self._handle_serial_lost(exc)
+            return False
+
+        now = time.monotonic()
+        with self._status_lock:
+            self._last_probe_monotonic = now
+            self._last_probe_line = line
+            self._last_probe_reason = str(reason)
+            self._probe_sent_count += 1
+        return True
+
     def connect(self) -> bool:
         """Open serial transport and start reader + TCP threads."""
         with self._state_lock:
@@ -332,7 +392,8 @@ class SerialAdapter:
         with self._state_lock:
             self._reset_runtime_state()
             self._start_locked()
-            return True
+        self._send_next_auto_probe(reason="connect", force=True)
+        return True
 
     def start(self) -> None:
         """Start reader/TCP threads when serial transport is already assigned."""
@@ -537,6 +598,8 @@ class SerialAdapter:
                 emitted = self._process_chunk(chunk)
                 if has_serial:
                     self._flush_queued_control(max_items=8)
+                    if not chunk and not emitted:
+                        self._send_next_auto_probe(reason="idle")
                 if not chunk and not emitted:
                     time.sleep(self._reader_sleep_s)
             except RuntimeError as exc:
@@ -1071,6 +1134,7 @@ class SerialAdapter:
         with self._status_lock:
             self._rx_timestamps.append(now)
             self._prune_timestamps_locked(self._rx_timestamps, now)
+            self._last_rx_monotonic = now
 
     def _record_control_accepted(self) -> None:
         now = time.monotonic()
@@ -1122,6 +1186,11 @@ class SerialAdapter:
             control_commands_rejected = int(self._control_commands_rejected)
             control_commands_queued = int(self._control_commands_queued)
             queued_control_dropped = int(self._queued_control_dropped)
+            last_rx_monotonic = float(self._last_rx_monotonic)
+            last_probe_monotonic = float(self._last_probe_monotonic)
+            last_probe_line = self._last_probe_line
+            last_probe_reason = self._last_probe_reason
+            probe_sent_count = int(self._probe_sent_count)
         with self._control_lock:
             self._expire_control_lease_locked(now)
             lease_owner = self._control_lease_owner
@@ -1149,6 +1218,16 @@ class SerialAdapter:
             lease_remaining_s = max(0.0, lease_expires - now)
         else:
             lease_remaining_s = None
+        telemetry_last_rx_s_ago: Optional[float]
+        if last_rx_monotonic > 0.0:
+            telemetry_last_rx_s_ago = max(0.0, now - last_rx_monotonic)
+        else:
+            telemetry_last_rx_s_ago = None
+        probe_last_sent_s_ago: Optional[float]
+        if last_probe_monotonic > 0.0:
+            probe_last_sent_s_ago = max(0.0, now - last_probe_monotonic)
+        else:
+            probe_last_sent_s_ago = None
 
         if self._compat_server is not None:
             connected_clients = self._compat_server.get_client_count()
@@ -1176,6 +1255,15 @@ class SerialAdapter:
             "serial_last_error": serial_last_error,
             "serial_port": self._port,
             "serial_baudrate": int(self._baudrate),
+            "telemetry_last_rx_s_ago": telemetry_last_rx_s_ago,
+            "auto_probe": {
+                "enabled": True,
+                "sequence": list(AUTO_PROBE_SEQUENCE),
+                "sent_count": probe_sent_count,
+                "last_line": last_probe_line,
+                "last_reason": last_probe_reason,
+                "last_sent_s_ago": probe_last_sent_s_ago,
+            },
             "control_lease": {
                 "owner": lease_owner,
                 "priority": lease_priority,
@@ -1224,6 +1312,13 @@ class SerialAdapter:
                     "motor_pwm",
                 ],
                 "llm_observer_mode": "summary_only_recommended",
+                "auto_probe": {
+                    "enabled": True,
+                    "sequence": list(AUTO_PROBE_SEQUENCE),
+                    "idle_interval_s": float(AUTO_PROBE_IDLE_INTERVAL_S),
+                    "min_gap_s": float(AUTO_PROBE_MIN_GAP_S),
+                    "purpose": "wake telemetry streaming firmware and reduce manual retries",
+                },
             },
             "control": {
                 "unsafe_passthrough": bool(self._unsafe_passthrough),

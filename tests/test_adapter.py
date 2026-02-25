@@ -192,6 +192,8 @@ _STATUS_REQUIRED_FIELDS = {
     "control_commands_accepted",
     "control_commands_rejected",
     "control_lease",
+    "auto_probe",
+    "telemetry_last_rx_s_ago",
 }
 
 
@@ -224,6 +226,21 @@ def test_get_status_fields(
     assert 0.0 <= ratio <= 1.0
     assert int(status["control_commands_accepted"]) >= 2
     assert int(status["control_commands_rejected"]) >= 1
+    auto_probe = status["auto_probe"]
+    assert isinstance(auto_probe, dict)
+    assert auto_probe["enabled"] is True
+    assert isinstance(auto_probe["sequence"], list)
+
+
+def test_auto_probe_sends_handshake_on_connect():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False, unsafe_passthrough=True)
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+    adapter._reset_runtime_state()  # type: ignore[attr-defined]
+
+    sent = adapter._send_next_auto_probe(reason="test", force=True)  # type: ignore[attr-defined]
+    assert sent is True
+    assert any(item in fake.writes for item in [b"STATUS?\n", b"IMU_ON\n", b"TELEMETRY_ON\n", b"STREAM_ON\n", b"IMU?\n"])
 
 
 def test_invalid_json_frame(

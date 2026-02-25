@@ -41,6 +41,13 @@ This verifies:
 - node path/artifacts
 - telemetry/control port listening
 - pyserial serial-port probe
+- installed OpenClaw extension marker freshness (`serial_intent`/`serial_bridge_sync`)
+
+If extension is stale (`openclaw_extension.up_to_date=false`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/deploy_local_extension.ps1 -RestartGateway
+```
 
 ## 4) COM port ownership rule (single-COM boards)
 
