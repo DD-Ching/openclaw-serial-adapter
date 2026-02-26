@@ -24,6 +24,15 @@ Parse the JSON result and decide from these fields:
 - `dynamic_session_path.session_sticky`: true means repeated semantic calls reuse the same bridge session.
 - `hardware_path.diagnosis`: exact cause when telemetry/control is not fully validated.
 
+## Use references
+
+When any warning/blocking item appears in `preflight-runtime` or `self-verify`:
+
+1. Read `references/common-pitfalls.md`.
+2. Match by diagnosis/warning/error keyword.
+3. Apply the mapped fix command sequence.
+4. Rerun `npm run preflight-runtime` then `npm run self-verify`.
+
 ## Decision policy
 
 1. Stop release if `publish_ready=false`.
