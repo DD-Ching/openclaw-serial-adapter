@@ -85,6 +85,36 @@ node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/co
 python scripts/hardware_e2e_check.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --observe-s 2.5 --drive-angle 90
 ```
 
+4b. Semantic E2E gate (LLM text -> plugin intent -> hardware verify):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/semantic_e2e_check.ps1
+```
+
+4c. One-command self-verify gate (install/runtime + semantic + hardware + sticky session + compliance):
+
+```powershell
+npm run self-verify
+```
+
+Runtime-only preflight (faster, before semantic/hardware checks):
+
+```powershell
+npm run preflight-runtime
+```
+
+Repeatable full validation (single command for recurring checks):
+
+```powershell
+npm run validate:repeatable
+```
+
+The command prints one JSON report with:
+- `publish_ready`: true means packaging/install/compliance gates are green.
+- `merge_main_ready`: true means publish gate + semantic gate + hardware gate are all green.
+- `dynamic_session_path.session_sticky`: confirms repeated semantic calls reused the same bridge session.
+- `hardware_path.diagnosis`: exact reason when IMU/telemetry is not flowing.
+
 5. Send low-rate control command and read machine-readable ACK:
 
 ```bash
@@ -107,6 +137,8 @@ node plugins/openclaw_ts_bridge/control_bridge.js --com COM3 --baud 115200
 Before opening any PR, run and review:
 
 - `docs/release/PRE_PR_CHECKLIST.md`
+- `docs/release/OFFICIAL_GUIDELINES_MAP.md`
+- `docs/release/LONG_TERM_OPTIMIZATION_ROADMAP.md`
 
 Rule: if checklist is not fully green, stop and fix first.
 
@@ -130,6 +162,12 @@ Pause and release COM immediately (hold for 30s):
 python examples/runtime_ops.py pause --hold-s 30
 ```
 
+Or request a machine-readable yield with requester/reason trace:
+
+```text
+call serial_yield(seconds=30, requestedBy="arduino_ide", reason="firmware_upload")
+```
+
 Resume COM right after upload:
 
 ```bash
@@ -151,6 +189,7 @@ python examples/runtime_ops.py capabilities
 
 Behavior:
 - `pause` closes serial handle but keeps plugin process/TCP ports alive.
+- `serial_yield` records who requested yield and why (`runtime_status.com_arbitration.last_yield_request`).
 - During pause, adapter does not occupy COM.
 - After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
 - Control commands received during COM pause/conflict are queued (bounded queue) and flushed automatically after reconnect.
@@ -279,6 +318,7 @@ Add to your OpenClaw config (`openclaw.json`):
 | `serial_motion_template` | Run built-in servo motion templates |
 | `serial_status` | Get runtime status + recent telemetry snapshot summary |
 | `serial_pause` | Temporarily release COM for upload |
+| `serial_yield` | Arbitration-aware COM yield request (with requester/reason trace) |
 | `serial_resume` | Re-open COM after upload |
 
 ## AI Prompt Examples

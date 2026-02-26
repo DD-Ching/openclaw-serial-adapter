@@ -77,6 +77,7 @@ interface StopVerification {
   reason: string;
   last_servo?: number;
   servo_range?: number;
+  servo_tail_range?: number;
   target_angle?: number;
   last_motor_pwm?: number;
   motor_pwm_range?: number;
@@ -120,11 +121,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function isBridgeConnected(): boolean {
-  return Boolean(
-    launcher?.isRunning() &&
-      telemetryClient?.isConnected() &&
-      controlClient?.isConnected()
-  );
+  return Boolean(telemetryClient?.isConnected() && controlClient?.isConnected());
 }
 
 function resolveToolAutoConnect(
@@ -180,6 +177,23 @@ function extractRuntimeCapabilities(
   return asRecord(record.capabilities);
 }
 
+function extractSerialPort(status: Record<string, unknown> | null): string | null {
+  const value = status?.serial_port;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function resolveKnownSerialPort(
+  config: PluginConfig,
+  runtimeStatus?: Record<string, unknown> | null
+): string | null {
+  return (
+    launcher?.getResolvedPort() ??
+    extractSerialPort(runtimeStatus ?? null) ??
+    config.serialPort ??
+    null
+  );
+}
+
 async function sendRuntimeCommandWithAck(
   command: Record<string, unknown>,
   config: PluginConfig
@@ -207,6 +221,76 @@ async function requestRuntimeCapabilities(
     config
   );
   return extractRuntimeCapabilities(ack);
+}
+
+async function tryAttachExistingBridge(
+  config: PluginConfig
+): Promise<{
+  attached: boolean;
+  runtimeStatus: Record<string, unknown> | null;
+  serialPort: string | null;
+}> {
+  const telemetryPort = config.telemetryPort ?? 9000;
+  const controlPort = config.controlPort ?? 9001;
+  try {
+    await attachAdapterChannels(config, {
+      telemetry_port: telemetryPort,
+      control_port: controlPort,
+    });
+  } catch {
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  const capabilities = await requestRuntimeCapabilities(config);
+  const runtimeStatus = await requestRuntimeStatus(config);
+  const looksLikeAdapter =
+    Boolean(capabilities?.runtime_protocol_version) ||
+    Boolean(
+      runtimeStatus &&
+        Object.prototype.hasOwnProperty.call(runtimeStatus, "serial_connected") &&
+        Object.prototype.hasOwnProperty.call(runtimeStatus, "serial_port")
+    );
+  const serialPort = extractSerialPort(runtimeStatus);
+  const requestedPort =
+    typeof config.serialPort === "string" ? config.serialPort.trim() : "";
+
+  if (!looksLikeAdapter) {
+    telemetryClient?.disconnect();
+    telemetryClient = null;
+    controlClient?.disconnect();
+    controlClient = null;
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  if (
+    requestedPort &&
+    serialPort &&
+    requestedPort.toLowerCase() !== serialPort.toLowerCase()
+  ) {
+    telemetryClient?.disconnect();
+    telemetryClient = null;
+    controlClient?.disconnect();
+    controlClient = null;
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  return {
+    attached: true,
+    runtimeStatus,
+    serialPort,
+  };
 }
 
 function getBridgeSessionState(): Record<string, unknown> {
@@ -270,7 +354,7 @@ async function ensureBridgeReady(
         connected: false,
         auto_connected: false,
         resumed: false,
-        serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+        serial_port: resolveKnownSerialPort(dynamicConfig),
         runtime_status: null,
         bridge_session: getBridgeSessionState(),
         error: "Not connected and autoConnect is disabled.",
@@ -299,7 +383,7 @@ async function ensureBridgeReady(
           connected: false,
           auto_connected: false,
           resumed: false,
-          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          serial_port: resolveKnownSerialPort(dynamicConfig),
           runtime_status: null,
           bridge_session: getBridgeSessionState(),
           error: toErrorMessage(error),
@@ -318,7 +402,7 @@ async function ensureBridgeReady(
           connected: false,
           auto_connected: false,
           resumed: false,
-          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          serial_port: resolveKnownSerialPort(dynamicConfig),
           runtime_status: null,
           bridge_session: getBridgeSessionState(),
           error: toErrorMessage(error),
@@ -354,7 +438,7 @@ async function ensureBridgeReady(
     connected: true,
     auto_connected: autoConnected,
     resumed,
-    serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+    serial_port: resolveKnownSerialPort(dynamicConfig, runtimeStatus),
     runtime_status: runtimeStatus,
     bridge_session: getBridgeSessionState(),
   };
@@ -701,6 +785,121 @@ async function collectTelemetryFrames(
   return collected.slice(0, safeMax);
 }
 
+function flushTelemetryBacklog(maxFrames = 400): number {
+  if (!telemetryClient) return 0;
+  const safeMax = Math.max(1, Math.min(Math.floor(maxFrames), 1000));
+  return telemetryClient.pollFrames(safeMax).length;
+}
+
+interface ObservedTelemetryWindow {
+  frames: TelemetryFrame[];
+  summary: Record<string, unknown>;
+}
+
+async function observeTelemetryWindow(
+  durationMs: number,
+  maxFrames = DEFAULT_OBSERVE_MAX_FRAMES
+): Promise<ObservedTelemetryWindow> {
+  const frames = await collectTelemetryFrames(durationMs, maxFrames);
+  return {
+    frames,
+    summary: summarizeTelemetryFrames(
+      frames,
+      telemetryClient?.bufferedCount() ?? 0
+    ),
+  };
+}
+
+function extractRuntimeDiagnosis(
+  runtimeStatus: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  const diag = asRecord(runtimeStatus?.diagnosis);
+  if (!diag) return null;
+  const code = typeof diag.code === "string" ? diag.code : null;
+  if (!code) return null;
+  return {
+    code,
+    severity: typeof diag.severity === "string" ? diag.severity : null,
+    detail: typeof diag.detail === "string" ? diag.detail : null,
+    next_step: typeof diag.next_step === "string" ? diag.next_step : null,
+    auto_repair: asRecord(diag.auto_repair),
+  };
+}
+
+function mergeRuntimeDiagnosisIntoSummary(
+  summary: Record<string, unknown>,
+  runtimeStatus: Record<string, unknown> | null,
+  frameCount: number
+): Record<string, unknown> {
+  const runtimeDiagnosis = extractRuntimeDiagnosis(runtimeStatus);
+  const merged: Record<string, unknown> = { ...(summary ?? {}) };
+  if (!runtimeDiagnosis) return merged;
+
+  const runtimeCode =
+    typeof runtimeDiagnosis.code === "string" ? runtimeDiagnosis.code : null;
+  const runtimeNextStep =
+    typeof runtimeDiagnosis.next_step === "string"
+      ? runtimeDiagnosis.next_step
+      : null;
+  const observedDiagnosis =
+    typeof merged.diagnosis === "string" ? merged.diagnosis : null;
+
+  const shouldOverride =
+    runtimeCode !== null &&
+    runtimeCode !== "ok" &&
+    (frameCount <= 0 ||
+      observedDiagnosis === null ||
+      observedDiagnosis === "no_telemetry_frames");
+  if (shouldOverride) {
+    merged.diagnosis = runtimeCode;
+    if (runtimeNextStep) merged.next_step = runtimeNextStep;
+  }
+  merged.runtime_diagnosis = runtimeDiagnosis;
+  return merged;
+}
+
+function enrichUnverifiableVerification(
+  verification: StopVerification,
+  runtimeStatus: Record<string, unknown> | null
+): {
+  verification: StopVerification;
+  runtime_diagnosis?: Record<string, unknown>;
+  next_step?: string;
+} {
+  const runtimeDiagnosis = extractRuntimeDiagnosis(runtimeStatus);
+  if (!runtimeDiagnosis) return { verification };
+  if (verification.mode !== "unverifiable") {
+    return { verification, runtime_diagnosis: runtimeDiagnosis };
+  }
+
+  const runtimeCode =
+    typeof runtimeDiagnosis.code === "string" ? runtimeDiagnosis.code : null;
+  const runtimeNextStep =
+    typeof runtimeDiagnosis.next_step === "string"
+      ? runtimeDiagnosis.next_step
+      : null;
+  if (!runtimeCode || runtimeCode === "ok") {
+    return { verification, runtime_diagnosis: runtimeDiagnosis };
+  }
+
+  const enriched: StopVerification = {
+    ...verification,
+    reason: `unverifiable_runtime_${runtimeCode}`,
+  };
+  return {
+    verification: enriched,
+    runtime_diagnosis: runtimeDiagnosis,
+    next_step: runtimeNextStep ?? undefined,
+  };
+}
+
+function optionalFrames(
+  frames: TelemetryFrame[],
+  includeFrames?: boolean
+): TelemetryFrame[] | undefined {
+  return includeFrames === true ? frames : undefined;
+}
+
 function pwmToApproxAngle(pwm: number): number {
   const normalized = clamp(Math.round(((pwm - 500) / 2000) * 180), 0, 180);
   return normalized;
@@ -817,14 +1016,17 @@ async function sendBestEffortStopSequence(options: {
   const intervalMs = Math.max(20, Math.min(Math.floor(options.intervalMs), 1000));
 
   for (let i = 0; i < repeats; i += 1) {
-    // Stop keywords for firmware that implements explicit stop/sweep toggles.
+    // Motor-style stop first, then servo-safe center/hold to avoid firmware
+    // variants mapping motor_pwm=0 to an endpoint angle.
+    sendManagedJsonCommand({ motor_pwm: 0 }, options.source);
+    sendManagedJsonCommand({ target_velocity: 0 }, options.source);
     sendManagedRawLine("STOP", options.source);
     sendManagedRawLine("SWEEP_OFF", options.source);
+    sendManagedRawLine("CENTER", options.source);
     // Send both plain angle and A<angle> to cover common UNO parser variants.
     sendManagedRawLine(String(targetAngle), options.source);
     sendManagedRawLine(`A${targetAngle}`, options.source);
-    sendManagedJsonCommand({ motor_pwm: 0 }, options.source);
-    sendManagedJsonCommand({ target_velocity: 0 }, options.source);
+    sendManagedRawLine("HOLD", options.source);
     await sleep(intervalMs);
   }
 }
@@ -844,7 +1046,8 @@ async function sendServoAngleBestEffort(
 
 function evaluateStopVerification(
   frames: TelemetryFrame[],
-  targetAngle: number
+  targetAngle: number,
+  mode: "target" | "stop" = "target"
 ): StopVerification {
   const servoValues = frames
     .map((frame) => readNumericField(frame, "servo"))
@@ -856,18 +1059,26 @@ function evaluateStopVerification(
   if (servoValues.length > 0) {
     const last = servoValues[servoValues.length - 1];
     const servoRange = rangeOf(servoValues) ?? 0;
+    const tailWindow = servoValues.slice(-Math.min(6, servoValues.length));
+    const servoTailRange = rangeOf(tailWindow) ?? servoRange;
     const nearTarget = Math.abs(last - targetAngle) <= 4;
-    const stable = servoRange <= 4;
+    const stable = servoTailRange <= 3;
+    const verified = mode === "stop" ? stable : nearTarget && stable;
     return {
-      verified: nearTarget && stable,
+      verified,
       mode: "servo_feedback",
       last_servo: last,
       servo_range: servoRange,
+      servo_tail_range: servoTailRange,
       target_angle: targetAngle,
       reason:
-        nearTarget && stable
-          ? "servo_stable_near_target"
-          : "servo_not_stable_or_not_near_target",
+        mode === "stop"
+          ? verified
+            ? "servo_tail_stable_no_motion"
+            : "servo_still_moving"
+          : nearTarget && stable
+            ? "servo_tail_stable_near_target"
+            : "servo_not_stable_or_not_near_target",
     };
   }
 
@@ -923,52 +1134,55 @@ async function executeSemanticIntent(options: {
   }
 
   if (intent === "status") {
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
+    const observed = await observeTelemetryWindow(verifyMs);
     return {
       status: "ok",
       intent,
       action: "observe_only",
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
   if (intent === "stop") {
+    flushTelemetryBacklog();
     await sendBestEffortStopSequence({
       targetAngle: STOP_TARGET_DEFAULT,
       repeats: 2,
       intervalMs: 120,
       source: options.source,
     });
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, STOP_TARGET_DEFAULT);
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(
+      observed.frames,
+      STOP_TARGET_DEFAULT,
+      "stop"
+    );
     return {
       status: "ok",
       intent,
       action: "best_effort_stop",
       target_angle: STOP_TARGET_DEFAULT,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
   if (intent === "center") {
     const target = parseAbsoluteAngle(text, options.targetAngle) ?? STOP_TARGET_DEFAULT;
+    flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, target);
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(observed.frames, target);
     return {
       status: "ok",
       intent,
       action: "set_center",
       target_angle: target,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
@@ -981,10 +1195,10 @@ async function executeSemanticIntent(options: {
     const target =
       absoluteOverride !== null ? absoluteOverride : clamp(current + sign * delta, 0, 180);
 
+    flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
-    const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-    const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, target);
+    const observed = await observeTelemetryWindow(verifyMs);
+    const verification = evaluateStopVerification(observed.frames, target);
     return {
       status: "ok",
       intent,
@@ -994,32 +1208,69 @@ async function executeSemanticIntent(options: {
       delta: Math.abs(target - current),
       intensity,
       verification,
-      summary,
-      frames: includeFrames ? frames : undefined,
+      summary: observed.summary,
+      frames: optionalFrames(observed.frames, includeFrames),
     };
   }
 
   const sequence =
     intent === "nod" ? [90, 75, 100, 80, 90] : [90, 70, 110, 75, 105, 90];
+  flushTelemetryBacklog();
   for (const angle of sequence) {
     await sendServoAngleBestEffort(angle, options.source);
     await sleep(180);
   }
-  const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-  const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-  const verification = evaluateStopVerification(frames, 90);
+  const observed = await observeTelemetryWindow(verifyMs);
+  const verification = evaluateStopVerification(observed.frames, 90);
   return {
     status: "ok",
     intent,
     action: intent === "nod" ? "motion_nod" : "motion_shake",
     sequence,
     verification,
-    summary,
-    frames: includeFrames ? frames : undefined,
+    summary: observed.summary,
+    frames: optionalFrames(observed.frames, includeFrames),
   };
 }
 
 async function connectAdapter(config: PluginConfig) {
+  const existing = await tryAttachExistingBridge(config);
+  if (existing.attached) {
+    markNewBridgeSession();
+    let availablePorts: string[] = [];
+    try {
+      availablePorts = (await listSerialPorts(config)).map((port) => port.device);
+    } catch {
+      // Keep lightweight attach path even when probe fails.
+    }
+    const resolvedPort = existing.serialPort ?? resolveKnownSerialPort(config, existing.runtimeStatus);
+    if (resolvedPort && !availablePorts.includes(resolvedPort)) {
+      availablePorts = [resolvedPort, ...availablePorts];
+    }
+    const result = {
+      status: "connected" as const,
+      bridge_mode: "attached_existing" as const,
+      serial_port: resolvedPort,
+      serial_ports_available: availablePorts,
+      telemetry_port: config.telemetryPort ?? 9000,
+      control_port: config.controlPort ?? 9001,
+      pid: null,
+      runtime_status: existing.runtimeStatus,
+      bridge_session: getBridgeSessionState(),
+    };
+    log.info(
+      JSON.stringify({
+        event: "serial_adapter_attached_existing",
+        bridge_session: getBridgeSessionState(),
+        serial_port: result.serial_port,
+        serial_ports_available: result.serial_ports_available,
+        telemetry_port: result.telemetry_port,
+        control_port: result.control_port,
+      })
+    );
+    return result;
+  }
+
   launcher = new PythonLauncher(config);
   const ready = await launcher.start();
   markNewBridgeSession();
@@ -1351,8 +1602,42 @@ const plugin = {
           source,
         });
 
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const output: Record<string, unknown> = { ...result };
+        const summaryRecord = asRecord(output.summary);
+        if (summaryRecord) {
+          const frameCountFromSummary = asFiniteNumber(summaryRecord.frame_count);
+          const frameCount =
+            frameCountFromSummary !== null
+              ? Math.max(0, Math.floor(frameCountFromSummary))
+              : Array.isArray(output.frames)
+                ? output.frames.length
+                : 0;
+          output.summary = mergeRuntimeDiagnosisIntoSummary(
+            summaryRecord,
+            runtimeStatus,
+            frameCount
+          );
+        }
+
+        const verificationRecord = asRecord(output.verification);
+        if (verificationRecord) {
+          const enriched = enrichUnverifiableVerification(
+            verificationRecord as unknown as StopVerification,
+            runtimeStatus
+          );
+          output.verification = enriched.verification;
+          if (enriched.runtime_diagnosis) {
+            output.runtime_diagnosis = enriched.runtime_diagnosis;
+          }
+          if (enriched.next_step) {
+            output.next_step = enriched.next_step;
+          }
+        }
+
         return jsonResult({
-          ...result,
+          ...output,
           control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
@@ -1477,6 +1762,12 @@ const plugin = {
         includeFrames: Type.Optional(
           Type.Boolean({ description: "Include sampled frames for debug." })
         ),
+        includeRuntimeStatus: Type.Optional(
+          Type.Boolean({
+            description:
+              "Include full bridge.runtime_status in response (default false for compact output).",
+          })
+        ),
         driveAngle: Type.Optional(
           Type.Number({
             description:
@@ -1559,6 +1850,27 @@ const plugin = {
           runtimeStatus?.telemetry_last_rx_s_ago
         );
         const runtimeAutoProbe = asRecord(runtimeStatus?.auto_probe);
+        const runtimeDiagnosis = asRecord(runtimeStatus?.diagnosis);
+        const runtimeDiagnosisCode =
+          runtimeDiagnosis && typeof runtimeDiagnosis.code === "string"
+            ? runtimeDiagnosis.code
+            : null;
+        const runtimeDiagnosisSeverity =
+          runtimeDiagnosis && typeof runtimeDiagnosis.severity === "string"
+            ? runtimeDiagnosis.severity
+            : null;
+        const runtimeDiagnosisDetail =
+          runtimeDiagnosis && typeof runtimeDiagnosis.detail === "string"
+            ? runtimeDiagnosis.detail
+            : null;
+        const runtimeDiagnosisNextStep =
+          runtimeDiagnosis && typeof runtimeDiagnosis.next_step === "string"
+            ? runtimeDiagnosis.next_step
+            : null;
+        const runtimeAutoRepair = asRecord(runtimeDiagnosis?.auto_repair);
+        const runtimeProbeSuppressedRemaining = asFiniteNumber(
+          runtimeAutoRepair?.probe_suppressed_remaining_s
+        );
         const runtimeLastAutoProbeSAgo = asFiniteNumber(
           runtimeAutoProbe?.last_sent_s_ago
         );
@@ -1571,6 +1883,11 @@ const plugin = {
         if (probeRequested) {
           if (telemetryLastRxSAgo !== null && telemetryLastRxSAgo <= 1.2) {
             probeReason = "skipped_recent_telemetry";
+          } else if (
+            runtimeProbeSuppressedRemaining !== null &&
+            runtimeProbeSuppressedRemaining > 0
+          ) {
+            probeReason = "runtime_probe_suppressed";
           } else if (
             runtimeLastAutoProbeSAgo !== null &&
             runtimeLastAutoProbeSAgo <= 0.9
@@ -1591,6 +1908,7 @@ const plugin = {
         if (typeof params.driveAngle === "number" && Number.isFinite(params.driveAngle)) {
           const target = clamp(Math.round(params.driveAngle), 0, 180);
           try {
+            flushTelemetryBacklog();
             await sendServoAngleBestEffort(target, source);
             driveAction = { requested: target, sent: true };
           } catch (error) {
@@ -1602,15 +1920,41 @@ const plugin = {
           }
         }
 
-        const frames = await collectTelemetryFrames(observeMs, maxFrames);
-        const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
+        const observed = await observeTelemetryWindow(observeMs, maxFrames);
+        const summary: Record<string, unknown> = {
+          ...(observed.summary ?? {}),
+        };
+        const observedDiagnosis =
+          typeof summary.diagnosis === "string" ? summary.diagnosis : null;
+        const shouldApplyRuntimeDiagnosis =
+          runtimeDiagnosisCode !== null &&
+          runtimeDiagnosisCode !== "ok" &&
+          (observed.frames.length === 0 ||
+            observedDiagnosis === null ||
+            observedDiagnosis === "no_telemetry_frames");
+        if (shouldApplyRuntimeDiagnosis) {
+          summary.diagnosis = runtimeDiagnosisCode;
+          if (runtimeDiagnosisNextStep) {
+            summary.next_step = runtimeDiagnosisNextStep;
+          }
+        }
+        if (runtimeDiagnosisCode !== null) {
+          summary.runtime_diagnosis = {
+            code: runtimeDiagnosisCode,
+            severity: runtimeDiagnosisSeverity,
+            detail: runtimeDiagnosisDetail,
+            next_step: runtimeDiagnosisNextStep,
+            probe_suppressed_remaining_s: runtimeProbeSuppressedRemaining,
+          };
+        }
         const includeFrames = params.includeFrames === true;
+        const includeRuntimeStatus = params.includeRuntimeStatus === true;
 
         return jsonResult({
           status: "connected",
           port: bridge.serial_port,
           observe_ms: observeMs,
-          sampled_frames: frames.length,
+          sampled_frames: observed.frames.length,
           summary,
           probe: {
             requested: probeRequested,
@@ -1625,10 +1969,10 @@ const plugin = {
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
-            runtime_status: bridge.runtime_status,
+            runtime_status: includeRuntimeStatus ? bridge.runtime_status : undefined,
             session: bridge.bridge_session,
           },
-          frames: includeFrames ? frames : undefined,
+          frames: optionalFrames(observed.frames, includeFrames),
         });
       },
     });
@@ -1827,6 +2171,7 @@ const plugin = {
         );
 
         try {
+          flushTelemetryBacklog();
           await sendBestEffortStopSequence({
             targetAngle,
             repeats,
@@ -1842,9 +2187,28 @@ const plugin = {
           });
         }
 
-        const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
-        const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-        const verification = evaluateStopVerification(frames, targetAngle);
+        const observed = await observeTelemetryWindow(verifyMs);
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const rawVerification = evaluateStopVerification(
+          observed.frames,
+          targetAngle,
+          "stop"
+        );
+        const enriched = enrichUnverifiableVerification(
+          rawVerification,
+          runtimeStatus
+        );
+        const mergedSummary = mergeRuntimeDiagnosisIntoSummary(
+          observed.summary,
+          runtimeStatus,
+          observed.frames.length
+        );
+        const effectiveNextStep =
+          enriched.next_step ??
+          (enriched.verification.verified === true
+            ? "Stop verified from telemetry."
+            : "If motor is still moving, firmware may ignore runtime serial stop commands. Flash firmware that accepts stop/idle commands.");
 
         return jsonResult({
           status: "stop_sequence_sent",
@@ -1859,13 +2223,11 @@ const plugin = {
             serial_port: bridge.serial_port,
             session: bridge.bridge_session,
           },
-          verification,
-          summary,
-          frames: includeFrames ? frames : undefined,
-          next_step:
-            verification.verified === true
-              ? "Stop verified from telemetry."
-              : "If motor is still moving, firmware may ignore runtime serial stop commands. Flash firmware that accepts stop/idle commands.",
+          verification: enriched.verification,
+          runtime_diagnosis: enriched.runtime_diagnosis,
+          summary: mergedSummary,
+          frames: optionalFrames(observed.frames, includeFrames),
+          next_step: effectiveNextStep,
         });
       },
     });
@@ -1967,18 +2329,21 @@ const plugin = {
 
         if (template === "center_stop") {
           const targetAngle = pwmToApproxAngle(params.centerPwm ?? 1500);
+          flushTelemetryBacklog();
           await sendBestEffortStopSequence({
             targetAngle,
             repeats,
             intervalMs,
             source,
           });
-          const frames = await collectTelemetryFrames(
-            Math.max(400, Math.min(2000, intervalMs * repeats + 600)),
-            DEFAULT_OBSERVE_MAX_FRAMES
+          const observed = await observeTelemetryWindow(
+            Math.max(400, Math.min(2000, intervalMs * repeats + 600))
           );
-          const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-          const verification = evaluateStopVerification(frames, targetAngle);
+          const verification = evaluateStopVerification(
+            observed.frames,
+            targetAngle,
+            "stop"
+          );
           return jsonResult({
             status: "sent",
             template,
@@ -1991,14 +2356,14 @@ const plugin = {
               auto_connected: bridge.auto_connected,
               resumed: bridge.resumed,
               serial_port: bridge.serial_port,
-              session: bridge.bridge_session,
-            },
-            verification,
-            summary,
-            note:
-              verification.verified === true
-                ? "center_stop verified from telemetry."
-                : "center_stop command sent but not verified from telemetry.",
+            session: bridge.bridge_session,
+          },
+          verification,
+          summary: observed.summary,
+          note:
+            verification.verified === true
+              ? "center_stop verified from telemetry."
+              : "center_stop command sent but not verified from telemetry.",
           });
         }
 
@@ -2197,6 +2562,22 @@ const plugin = {
             minimum: 0,
           })
         ),
+        requestedBy: Type.Optional(
+          Type.String({
+            description:
+              "Who requested the COM yield (for arbitration trace), e.g. arduino_ide/uploader.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        reason: Type.Optional(
+          Type.String({
+            description:
+              "Why COM is paused (for trace), e.g. firmware_upload.",
+            minLength: 1,
+            maxLength: 80,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -2217,12 +2598,104 @@ const plugin = {
           {
           __adapter_cmd: "pause",
           hold_s: holdS > 0 ? holdS : undefined,
+          requested_by:
+            typeof params.requestedBy === "string" && params.requestedBy.trim().length > 0
+              ? params.requestedBy.trim()
+              : "serial_pause_tool",
+          reason:
+            typeof params.reason === "string" && params.reason.trim().length > 0
+              ? params.reason.trim()
+              : "manual_pause",
           },
           config
         );
         return jsonResult({
           status: "pause_requested",
           hold_s: holdS > 0 ? holdS : null,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+          runtime_ack: ack,
+          runtime_status: extractRuntimeStatus(ack),
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "serial_yield",
+      label: "Yield COM (Arbitration)",
+      description:
+        "Request COM yield via arbitration metadata so uploader/IDE can take over temporarily.",
+      parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        seconds: Type.Optional(
+          Type.Number({
+            description: "Yield duration seconds (default 30, 0 = manual resume)",
+            minimum: 0,
+          })
+        ),
+        requestedBy: Type.Optional(
+          Type.String({
+            description:
+              "Requester id for arbitration trace, e.g. arduino_ide/uploader/cli.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        reason: Type.Optional(
+          Type.String({
+            description:
+              "Reason for yield, e.g. firmware_upload/serial_monitor.",
+            minLength: 1,
+            maxLength: 80,
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: false,
+        });
+        if (!bridge.connected || !controlClient) {
+          return jsonResult({
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
+          });
+        }
+        const holdS =
+          typeof params.seconds === "number"
+            ? Math.max(0, Math.min(params.seconds, 300))
+            : 30;
+        const requestedBy =
+          typeof params.requestedBy === "string" && params.requestedBy.trim().length > 0
+            ? params.requestedBy.trim()
+            : "serial_yield_tool";
+        const reason =
+          typeof params.reason === "string" && params.reason.trim().length > 0
+            ? params.reason.trim()
+            : "com_arbitration_request";
+        const ack = await sendRuntimeCommandWithAck(
+          {
+            __adapter_cmd: "yield",
+            hold_s: holdS > 0 ? holdS : undefined,
+            requested_by: requestedBy,
+            reason,
+          },
+          config
+        );
+        return jsonResult({
+          status: "yield_requested",
+          hold_s: holdS > 0 ? holdS : null,
+          requested_by: requestedBy,
+          reason,
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,
