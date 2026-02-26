@@ -77,6 +77,7 @@ interface StopVerification {
   reason: string;
   last_servo?: number;
   servo_range?: number;
+  servo_tail_range?: number;
   target_angle?: number;
   last_motor_pwm?: number;
   motor_pwm_range?: number;
@@ -120,11 +121,7 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function isBridgeConnected(): boolean {
-  return Boolean(
-    launcher?.isRunning() &&
-      telemetryClient?.isConnected() &&
-      controlClient?.isConnected()
-  );
+  return Boolean(telemetryClient?.isConnected() && controlClient?.isConnected());
 }
 
 function resolveToolAutoConnect(
@@ -180,6 +177,23 @@ function extractRuntimeCapabilities(
   return asRecord(record.capabilities);
 }
 
+function extractSerialPort(status: Record<string, unknown> | null): string | null {
+  const value = status?.serial_port;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function resolveKnownSerialPort(
+  config: PluginConfig,
+  runtimeStatus?: Record<string, unknown> | null
+): string | null {
+  return (
+    launcher?.getResolvedPort() ??
+    extractSerialPort(runtimeStatus ?? null) ??
+    config.serialPort ??
+    null
+  );
+}
+
 async function sendRuntimeCommandWithAck(
   command: Record<string, unknown>,
   config: PluginConfig
@@ -207,6 +221,76 @@ async function requestRuntimeCapabilities(
     config
   );
   return extractRuntimeCapabilities(ack);
+}
+
+async function tryAttachExistingBridge(
+  config: PluginConfig
+): Promise<{
+  attached: boolean;
+  runtimeStatus: Record<string, unknown> | null;
+  serialPort: string | null;
+}> {
+  const telemetryPort = config.telemetryPort ?? 9000;
+  const controlPort = config.controlPort ?? 9001;
+  try {
+    await attachAdapterChannels(config, {
+      telemetry_port: telemetryPort,
+      control_port: controlPort,
+    });
+  } catch {
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  const capabilities = await requestRuntimeCapabilities(config);
+  const runtimeStatus = await requestRuntimeStatus(config);
+  const looksLikeAdapter =
+    Boolean(capabilities?.runtime_protocol_version) ||
+    Boolean(
+      runtimeStatus &&
+        Object.prototype.hasOwnProperty.call(runtimeStatus, "serial_connected") &&
+        Object.prototype.hasOwnProperty.call(runtimeStatus, "serial_port")
+    );
+  const serialPort = extractSerialPort(runtimeStatus);
+  const requestedPort =
+    typeof config.serialPort === "string" ? config.serialPort.trim() : "";
+
+  if (!looksLikeAdapter) {
+    telemetryClient?.disconnect();
+    telemetryClient = null;
+    controlClient?.disconnect();
+    controlClient = null;
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  if (
+    requestedPort &&
+    serialPort &&
+    requestedPort.toLowerCase() !== serialPort.toLowerCase()
+  ) {
+    telemetryClient?.disconnect();
+    telemetryClient = null;
+    controlClient?.disconnect();
+    controlClient = null;
+    return {
+      attached: false,
+      runtimeStatus: null,
+      serialPort: null,
+    };
+  }
+
+  return {
+    attached: true,
+    runtimeStatus,
+    serialPort,
+  };
 }
 
 function getBridgeSessionState(): Record<string, unknown> {
@@ -270,7 +354,7 @@ async function ensureBridgeReady(
         connected: false,
         auto_connected: false,
         resumed: false,
-        serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+        serial_port: resolveKnownSerialPort(dynamicConfig),
         runtime_status: null,
         bridge_session: getBridgeSessionState(),
         error: "Not connected and autoConnect is disabled.",
@@ -299,7 +383,7 @@ async function ensureBridgeReady(
           connected: false,
           auto_connected: false,
           resumed: false,
-          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          serial_port: resolveKnownSerialPort(dynamicConfig),
           runtime_status: null,
           bridge_session: getBridgeSessionState(),
           error: toErrorMessage(error),
@@ -318,7 +402,7 @@ async function ensureBridgeReady(
           connected: false,
           auto_connected: false,
           resumed: false,
-          serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+          serial_port: resolveKnownSerialPort(dynamicConfig),
           runtime_status: null,
           bridge_session: getBridgeSessionState(),
           error: toErrorMessage(error),
@@ -354,7 +438,7 @@ async function ensureBridgeReady(
     connected: true,
     auto_connected: autoConnected,
     resumed,
-    serial_port: launcher?.getResolvedPort() ?? dynamicConfig.serialPort ?? null,
+    serial_port: resolveKnownSerialPort(dynamicConfig, runtimeStatus),
     runtime_status: runtimeStatus,
     bridge_session: getBridgeSessionState(),
   };
@@ -701,6 +785,12 @@ async function collectTelemetryFrames(
   return collected.slice(0, safeMax);
 }
 
+function flushTelemetryBacklog(maxFrames = 400): number {
+  if (!telemetryClient) return 0;
+  const safeMax = Math.max(1, Math.min(Math.floor(maxFrames), 1000));
+  return telemetryClient.pollFrames(safeMax).length;
+}
+
 function pwmToApproxAngle(pwm: number): number {
   const normalized = clamp(Math.round(((pwm - 500) / 2000) * 180), 0, 180);
   return normalized;
@@ -817,14 +907,17 @@ async function sendBestEffortStopSequence(options: {
   const intervalMs = Math.max(20, Math.min(Math.floor(options.intervalMs), 1000));
 
   for (let i = 0; i < repeats; i += 1) {
-    // Stop keywords for firmware that implements explicit stop/sweep toggles.
+    // Motor-style stop first, then servo-safe center/hold to avoid firmware
+    // variants mapping motor_pwm=0 to an endpoint angle.
+    sendManagedJsonCommand({ motor_pwm: 0 }, options.source);
+    sendManagedJsonCommand({ target_velocity: 0 }, options.source);
     sendManagedRawLine("STOP", options.source);
     sendManagedRawLine("SWEEP_OFF", options.source);
+    sendManagedRawLine("CENTER", options.source);
     // Send both plain angle and A<angle> to cover common UNO parser variants.
     sendManagedRawLine(String(targetAngle), options.source);
     sendManagedRawLine(`A${targetAngle}`, options.source);
-    sendManagedJsonCommand({ motor_pwm: 0 }, options.source);
-    sendManagedJsonCommand({ target_velocity: 0 }, options.source);
+    sendManagedRawLine("HOLD", options.source);
     await sleep(intervalMs);
   }
 }
@@ -844,7 +937,8 @@ async function sendServoAngleBestEffort(
 
 function evaluateStopVerification(
   frames: TelemetryFrame[],
-  targetAngle: number
+  targetAngle: number,
+  mode: "target" | "stop" = "target"
 ): StopVerification {
   const servoValues = frames
     .map((frame) => readNumericField(frame, "servo"))
@@ -856,18 +950,26 @@ function evaluateStopVerification(
   if (servoValues.length > 0) {
     const last = servoValues[servoValues.length - 1];
     const servoRange = rangeOf(servoValues) ?? 0;
+    const tailWindow = servoValues.slice(-Math.min(6, servoValues.length));
+    const servoTailRange = rangeOf(tailWindow) ?? servoRange;
     const nearTarget = Math.abs(last - targetAngle) <= 4;
-    const stable = servoRange <= 4;
+    const stable = servoTailRange <= 3;
+    const verified = mode === "stop" ? stable : nearTarget && stable;
     return {
-      verified: nearTarget && stable,
+      verified,
       mode: "servo_feedback",
       last_servo: last,
       servo_range: servoRange,
+      servo_tail_range: servoTailRange,
       target_angle: targetAngle,
       reason:
-        nearTarget && stable
-          ? "servo_stable_near_target"
-          : "servo_not_stable_or_not_near_target",
+        mode === "stop"
+          ? verified
+            ? "servo_tail_stable_no_motion"
+            : "servo_still_moving"
+          : nearTarget && stable
+            ? "servo_tail_stable_near_target"
+            : "servo_not_stable_or_not_near_target",
     };
   }
 
@@ -935,6 +1037,7 @@ async function executeSemanticIntent(options: {
   }
 
   if (intent === "stop") {
+    flushTelemetryBacklog();
     await sendBestEffortStopSequence({
       targetAngle: STOP_TARGET_DEFAULT,
       repeats: 2,
@@ -943,7 +1046,7 @@ async function executeSemanticIntent(options: {
     });
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
-    const verification = evaluateStopVerification(frames, STOP_TARGET_DEFAULT);
+    const verification = evaluateStopVerification(frames, STOP_TARGET_DEFAULT, "stop");
     return {
       status: "ok",
       intent,
@@ -957,6 +1060,7 @@ async function executeSemanticIntent(options: {
 
   if (intent === "center") {
     const target = parseAbsoluteAngle(text, options.targetAngle) ?? STOP_TARGET_DEFAULT;
+    flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
@@ -981,6 +1085,7 @@ async function executeSemanticIntent(options: {
     const target =
       absoluteOverride !== null ? absoluteOverride : clamp(current + sign * delta, 0, 180);
 
+    flushTelemetryBacklog();
     await sendServoAngleBestEffort(target, options.source);
     const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
     const summary = summarizeTelemetryFrames(frames, telemetryClient?.bufferedCount() ?? 0);
@@ -1001,6 +1106,7 @@ async function executeSemanticIntent(options: {
 
   const sequence =
     intent === "nod" ? [90, 75, 100, 80, 90] : [90, 70, 110, 75, 105, 90];
+  flushTelemetryBacklog();
   for (const angle of sequence) {
     await sendServoAngleBestEffort(angle, options.source);
     await sleep(180);
@@ -1020,6 +1126,43 @@ async function executeSemanticIntent(options: {
 }
 
 async function connectAdapter(config: PluginConfig) {
+  const existing = await tryAttachExistingBridge(config);
+  if (existing.attached) {
+    markNewBridgeSession();
+    let availablePorts: string[] = [];
+    try {
+      availablePorts = (await listSerialPorts(config)).map((port) => port.device);
+    } catch {
+      // Keep lightweight attach path even when probe fails.
+    }
+    const resolvedPort = existing.serialPort ?? resolveKnownSerialPort(config, existing.runtimeStatus);
+    if (resolvedPort && !availablePorts.includes(resolvedPort)) {
+      availablePorts = [resolvedPort, ...availablePorts];
+    }
+    const result = {
+      status: "connected" as const,
+      bridge_mode: "attached_existing" as const,
+      serial_port: resolvedPort,
+      serial_ports_available: availablePorts,
+      telemetry_port: config.telemetryPort ?? 9000,
+      control_port: config.controlPort ?? 9001,
+      pid: null,
+      runtime_status: existing.runtimeStatus,
+      bridge_session: getBridgeSessionState(),
+    };
+    log.info(
+      JSON.stringify({
+        event: "serial_adapter_attached_existing",
+        bridge_session: getBridgeSessionState(),
+        serial_port: result.serial_port,
+        serial_ports_available: result.serial_ports_available,
+        telemetry_port: result.telemetry_port,
+        control_port: result.control_port,
+      })
+    );
+    return result;
+  }
+
   launcher = new PythonLauncher(config);
   const ready = await launcher.start();
   markNewBridgeSession();
@@ -1591,6 +1734,7 @@ const plugin = {
         if (typeof params.driveAngle === "number" && Number.isFinite(params.driveAngle)) {
           const target = clamp(Math.round(params.driveAngle), 0, 180);
           try {
+            flushTelemetryBacklog();
             await sendServoAngleBestEffort(target, source);
             driveAction = { requested: target, sent: true };
           } catch (error) {
@@ -1827,6 +1971,7 @@ const plugin = {
         );
 
         try {
+          flushTelemetryBacklog();
           await sendBestEffortStopSequence({
             targetAngle,
             repeats,
@@ -1844,7 +1989,7 @@ const plugin = {
 
         const frames = await collectTelemetryFrames(verifyMs, DEFAULT_OBSERVE_MAX_FRAMES);
         const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-        const verification = evaluateStopVerification(frames, targetAngle);
+        const verification = evaluateStopVerification(frames, targetAngle, "stop");
 
         return jsonResult({
           status: "stop_sequence_sent",
@@ -1967,6 +2112,7 @@ const plugin = {
 
         if (template === "center_stop") {
           const targetAngle = pwmToApproxAngle(params.centerPwm ?? 1500);
+          flushTelemetryBacklog();
           await sendBestEffortStopSequence({
             targetAngle,
             repeats,
@@ -1978,7 +2124,7 @@ const plugin = {
             DEFAULT_OBSERVE_MAX_FRAMES
           );
           const summary = summarizeTelemetryFrames(frames, telemetryClient.bufferedCount());
-          const verification = evaluateStopVerification(frames, targetAngle);
+          const verification = evaluateStopVerification(frames, targetAngle, "stop");
           return jsonResult({
             status: "sent",
             template,

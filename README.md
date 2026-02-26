@@ -85,6 +85,12 @@ node plugins/openclaw_ts_bridge/bridge.js --config plugins/openclaw_ts_bridge/co
 python scripts/hardware_e2e_check.py --host 127.0.0.1 --control-port 9001 --telemetry-port 9000 --observe-s 2.5 --drive-angle 90
 ```
 
+4b. Semantic E2E gate (LLM text -> plugin intent -> hardware verify):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/semantic_e2e_check.ps1
+```
+
 5. Send low-rate control command and read machine-readable ACK:
 
 ```bash
