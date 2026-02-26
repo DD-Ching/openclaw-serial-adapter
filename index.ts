@@ -810,6 +810,89 @@ async function observeTelemetryWindow(
   };
 }
 
+function extractRuntimeDiagnosis(
+  runtimeStatus: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  const diag = asRecord(runtimeStatus?.diagnosis);
+  if (!diag) return null;
+  const code = typeof diag.code === "string" ? diag.code : null;
+  if (!code) return null;
+  return {
+    code,
+    severity: typeof diag.severity === "string" ? diag.severity : null,
+    detail: typeof diag.detail === "string" ? diag.detail : null,
+    next_step: typeof diag.next_step === "string" ? diag.next_step : null,
+    auto_repair: asRecord(diag.auto_repair),
+  };
+}
+
+function mergeRuntimeDiagnosisIntoSummary(
+  summary: Record<string, unknown>,
+  runtimeStatus: Record<string, unknown> | null,
+  frameCount: number
+): Record<string, unknown> {
+  const runtimeDiagnosis = extractRuntimeDiagnosis(runtimeStatus);
+  const merged: Record<string, unknown> = { ...(summary ?? {}) };
+  if (!runtimeDiagnosis) return merged;
+
+  const runtimeCode =
+    typeof runtimeDiagnosis.code === "string" ? runtimeDiagnosis.code : null;
+  const runtimeNextStep =
+    typeof runtimeDiagnosis.next_step === "string"
+      ? runtimeDiagnosis.next_step
+      : null;
+  const observedDiagnosis =
+    typeof merged.diagnosis === "string" ? merged.diagnosis : null;
+
+  const shouldOverride =
+    runtimeCode !== null &&
+    runtimeCode !== "ok" &&
+    (frameCount <= 0 ||
+      observedDiagnosis === null ||
+      observedDiagnosis === "no_telemetry_frames");
+  if (shouldOverride) {
+    merged.diagnosis = runtimeCode;
+    if (runtimeNextStep) merged.next_step = runtimeNextStep;
+  }
+  merged.runtime_diagnosis = runtimeDiagnosis;
+  return merged;
+}
+
+function enrichUnverifiableVerification(
+  verification: StopVerification,
+  runtimeStatus: Record<string, unknown> | null
+): {
+  verification: StopVerification;
+  runtime_diagnosis?: Record<string, unknown>;
+  next_step?: string;
+} {
+  const runtimeDiagnosis = extractRuntimeDiagnosis(runtimeStatus);
+  if (!runtimeDiagnosis) return { verification };
+  if (verification.mode !== "unverifiable") {
+    return { verification, runtime_diagnosis: runtimeDiagnosis };
+  }
+
+  const runtimeCode =
+    typeof runtimeDiagnosis.code === "string" ? runtimeDiagnosis.code : null;
+  const runtimeNextStep =
+    typeof runtimeDiagnosis.next_step === "string"
+      ? runtimeDiagnosis.next_step
+      : null;
+  if (!runtimeCode || runtimeCode === "ok") {
+    return { verification, runtime_diagnosis: runtimeDiagnosis };
+  }
+
+  const enriched: StopVerification = {
+    ...verification,
+    reason: `unverifiable_runtime_${runtimeCode}`,
+  };
+  return {
+    verification: enriched,
+    runtime_diagnosis: runtimeDiagnosis,
+    next_step: runtimeNextStep ?? undefined,
+  };
+}
+
 function optionalFrames(
   frames: TelemetryFrame[],
   includeFrames?: boolean
@@ -1519,8 +1602,42 @@ const plugin = {
           source,
         });
 
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const output: Record<string, unknown> = { ...result };
+        const summaryRecord = asRecord(output.summary);
+        if (summaryRecord) {
+          const frameCountFromSummary = asFiniteNumber(summaryRecord.frame_count);
+          const frameCount =
+            frameCountFromSummary !== null
+              ? Math.max(0, Math.floor(frameCountFromSummary))
+              : Array.isArray(output.frames)
+                ? output.frames.length
+                : 0;
+          output.summary = mergeRuntimeDiagnosisIntoSummary(
+            summaryRecord,
+            runtimeStatus,
+            frameCount
+          );
+        }
+
+        const verificationRecord = asRecord(output.verification);
+        if (verificationRecord) {
+          const enriched = enrichUnverifiableVerification(
+            verificationRecord as unknown as StopVerification,
+            runtimeStatus
+          );
+          output.verification = enriched.verification;
+          if (enriched.runtime_diagnosis) {
+            output.runtime_diagnosis = enriched.runtime_diagnosis;
+          }
+          if (enriched.next_step) {
+            output.next_step = enriched.next_step;
+          }
+        }
+
         return jsonResult({
-          ...result,
+          ...output,
           control_source: buildControlSourceMeta(source),
           bridge: {
             auto_connected: bridge.auto_connected,
@@ -2064,11 +2181,27 @@ const plugin = {
         }
 
         const observed = await observeTelemetryWindow(verifyMs);
-        const verification = evaluateStopVerification(
+        const runtimeStatus =
+          bridge.runtime_status ?? (await requestRuntimeStatus(config));
+        const rawVerification = evaluateStopVerification(
           observed.frames,
           targetAngle,
           "stop"
         );
+        const enriched = enrichUnverifiableVerification(
+          rawVerification,
+          runtimeStatus
+        );
+        const mergedSummary = mergeRuntimeDiagnosisIntoSummary(
+          observed.summary,
+          runtimeStatus,
+          observed.frames.length
+        );
+        const effectiveNextStep =
+          enriched.next_step ??
+          (enriched.verification.verified === true
+            ? "Stop verified from telemetry."
+            : "If motor is still moving, firmware may ignore runtime serial stop commands. Flash firmware that accepts stop/idle commands.");
 
         return jsonResult({
           status: "stop_sequence_sent",
@@ -2083,13 +2216,11 @@ const plugin = {
             serial_port: bridge.serial_port,
             session: bridge.bridge_session,
           },
-          verification,
-          summary: observed.summary,
+          verification: enriched.verification,
+          runtime_diagnosis: enriched.runtime_diagnosis,
+          summary: mergedSummary,
           frames: optionalFrames(observed.frames, includeFrames),
-          next_step:
-            verification.verified === true
-              ? "Stop verified from telemetry."
-              : "If motor is still moving, firmware may ignore runtime serial stop commands. Flash firmware that accepts stop/idle commands.",
+          next_step: effectiveNextStep,
         });
       },
     });
