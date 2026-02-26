@@ -2555,6 +2555,22 @@ const plugin = {
             minimum: 0,
           })
         ),
+        requestedBy: Type.Optional(
+          Type.String({
+            description:
+              "Who requested the COM yield (for arbitration trace), e.g. arduino_ide/uploader.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        reason: Type.Optional(
+          Type.String({
+            description:
+              "Why COM is paused (for trace), e.g. firmware_upload.",
+            minLength: 1,
+            maxLength: 80,
+          })
+        ),
       }),
       async execute(_toolCallId, params) {
         const bridge = await ensureBridgeReady(config, {
@@ -2575,12 +2591,104 @@ const plugin = {
           {
           __adapter_cmd: "pause",
           hold_s: holdS > 0 ? holdS : undefined,
+          requested_by:
+            typeof params.requestedBy === "string" && params.requestedBy.trim().length > 0
+              ? params.requestedBy.trim()
+              : "serial_pause_tool",
+          reason:
+            typeof params.reason === "string" && params.reason.trim().length > 0
+              ? params.reason.trim()
+              : "manual_pause",
           },
           config
         );
         return jsonResult({
           status: "pause_requested",
           hold_s: holdS > 0 ? holdS : null,
+          bridge: {
+            auto_connected: bridge.auto_connected,
+            resumed: bridge.resumed,
+            serial_port: bridge.serial_port,
+            session: bridge.bridge_session,
+          },
+          runtime_ack: ack,
+          runtime_status: extractRuntimeStatus(ack),
+        });
+      },
+    });
+
+    api.registerTool({
+      name: "serial_yield",
+      label: "Yield COM (Arbitration)",
+      description:
+        "Request COM yield via arbitration metadata so uploader/IDE can take over temporarily.",
+      parameters: Type.Object({
+        autoConnect: Type.Optional(
+          Type.Boolean({
+            description:
+              "Auto connect if disconnected (default from toolAutoConnect, usually true).",
+          })
+        ),
+        seconds: Type.Optional(
+          Type.Number({
+            description: "Yield duration seconds (default 30, 0 = manual resume)",
+            minimum: 0,
+          })
+        ),
+        requestedBy: Type.Optional(
+          Type.String({
+            description:
+              "Requester id for arbitration trace, e.g. arduino_ide/uploader/cli.",
+            minLength: 1,
+            maxLength: 64,
+          })
+        ),
+        reason: Type.Optional(
+          Type.String({
+            description:
+              "Reason for yield, e.g. firmware_upload/serial_monitor.",
+            minLength: 1,
+            maxLength: 80,
+          })
+        ),
+      }),
+      async execute(_toolCallId, params) {
+        const bridge = await ensureBridgeReady(config, {
+          autoConnect: params.autoConnect,
+          autoResume: false,
+        });
+        if (!bridge.connected || !controlClient) {
+          return jsonResult({
+            error: bridge.error ?? "Not connected.",
+            next_step: bridge.next_step ?? "Call serial_connect first.",
+          });
+        }
+        const holdS =
+          typeof params.seconds === "number"
+            ? Math.max(0, Math.min(params.seconds, 300))
+            : 30;
+        const requestedBy =
+          typeof params.requestedBy === "string" && params.requestedBy.trim().length > 0
+            ? params.requestedBy.trim()
+            : "serial_yield_tool";
+        const reason =
+          typeof params.reason === "string" && params.reason.trim().length > 0
+            ? params.reason.trim()
+            : "com_arbitration_request";
+        const ack = await sendRuntimeCommandWithAck(
+          {
+            __adapter_cmd: "yield",
+            hold_s: holdS > 0 ? holdS : undefined,
+            requested_by: requestedBy,
+            reason,
+          },
+          config
+        );
+        return jsonResult({
+          status: "yield_requested",
+          hold_s: holdS > 0 ? holdS : null,
+          requested_by: requestedBy,
+          reason,
           bridge: {
             auto_connected: bridge.auto_connected,
             resumed: bridge.resumed,

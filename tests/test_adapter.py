@@ -192,6 +192,7 @@ _STATUS_REQUIRED_FIELDS = {
     "control_commands_accepted",
     "control_commands_rejected",
     "control_lease",
+    "com_arbitration",
     "auto_probe",
     "telemetry_last_rx_s_ago",
 }
@@ -413,6 +414,32 @@ def test_control_queue_full_is_rejected():
     status = adapter.get_status()
     assert status["queued_control_count"] == 1
     assert status["queued_control_dropped"] >= 1
+
+
+def test_runtime_yield_command_sets_arbitration_trace():
+    adapter = SerialAdapter("mock", 9600, enable_tcp=False, unsafe_passthrough=True)
+    fake = FakeSerial()
+    adapter._serial = fake  # type: ignore[attr-defined]
+
+    ack = adapter._handle_runtime_command(  # type: ignore[attr-defined]
+        {
+            "__adapter_cmd": "yield",
+            "requested_by": "arduino_ide",
+            "reason": "firmware_upload",
+            "hold_s": 20,
+        }
+    )
+    assert isinstance(ack, dict)
+    assert ack["ok"] is True
+    assert ack["action"] == "yield"
+
+    status = adapter.get_status()
+    assert status["serial_paused"] is True
+    arbitration = status["com_arbitration"]
+    assert arbitration["state"] == "yielded"
+    assert isinstance(arbitration["last_yield_request"], dict)
+    assert arbitration["last_yield_request"]["requested_by"] == "arduino_ide"
+    assert arbitration["last_yield_request"]["reason"] == "firmware_upload"
 
 
 # ---------------------------------------------------------------------------

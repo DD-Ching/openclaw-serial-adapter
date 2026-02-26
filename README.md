@@ -156,6 +156,12 @@ Pause and release COM immediately (hold for 30s):
 python examples/runtime_ops.py pause --hold-s 30
 ```
 
+Or request a machine-readable yield with requester/reason trace:
+
+```text
+call serial_yield(seconds=30, requestedBy="arduino_ide", reason="firmware_upload")
+```
+
 Resume COM right after upload:
 
 ```bash
@@ -177,6 +183,7 @@ python examples/runtime_ops.py capabilities
 
 Behavior:
 - `pause` closes serial handle but keeps plugin process/TCP ports alive.
+- `serial_yield` records who requested yield and why (`runtime_status.com_arbitration.last_yield_request`).
 - During pause, adapter does not occupy COM.
 - After `resume` (or `hold_s` timeout), adapter retries reopening COM every ~2s.
 - Control commands received during COM pause/conflict are queued (bounded queue) and flushed automatically after reconnect.
@@ -305,6 +312,7 @@ Add to your OpenClaw config (`openclaw.json`):
 | `serial_motion_template` | Run built-in servo motion templates |
 | `serial_status` | Get runtime status + recent telemetry snapshot summary |
 | `serial_pause` | Temporarily release COM for upload |
+| `serial_yield` | Arbitration-aware COM yield request (with requester/reason trace) |
 | `serial_resume` | Re-open COM after upload |
 
 ## AI Prompt Examples

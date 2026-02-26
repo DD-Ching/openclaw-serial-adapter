@@ -53,4 +53,17 @@ export interface AdapterStatus {
   ring_buffer_usage_ratio: number;
   control_commands_accepted: number;
   control_commands_rejected: number;
+  serial_connected?: boolean;
+  serial_paused?: boolean;
+  serial_pause_remaining_s?: number | null;
+  com_arbitration?: {
+    state?: "active" | "yielded" | "reclaiming" | "disconnected" | string;
+    serial_owner?: string | null;
+    last_yield_request?: {
+      requested_by?: string | null;
+      reason?: string | null;
+      requested_at_ms?: number | null;
+      hold_s?: number | null;
+    } | null;
+  };
 }

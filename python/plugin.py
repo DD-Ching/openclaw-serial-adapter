@@ -77,6 +77,7 @@ KEY_VALUE_NUMERIC_PATTERN = re.compile(
 ADAPTER_CMD_KEY = "__adapter_cmd"
 ADAPTER_CMD_PAUSE = "pause"
 ADAPTER_CMD_RESUME = "resume"
+ADAPTER_CMD_YIELD = "yield"
 ADAPTER_CMD_STATUS = "status"
 ADAPTER_CMD_CAPABILITIES = "capabilities"
 
@@ -141,6 +142,20 @@ def _is_busy_error_text(text: Optional[str]) -> bool:
     if not normalized:
         return False
     return any(hint in normalized for hint in PORT_BUSY_ERROR_HINTS)
+
+
+def _normalize_short_text(
+    value: Any,
+    *,
+    fallback: Optional[str] = None,
+    max_len: int = 64,
+) -> Optional[str]:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return fallback
+    if len(text) > max_len:
+        return text[:max_len]
+    return text
 
 
 def _diagnosis_default_next_step(code: str) -> str:
@@ -239,6 +254,7 @@ class SerialAdapter:
         self._serial_reconnect_attempts = 0
         self._serial_last_error: Optional[str] = None
         self._serial_connected_since_monotonic = 0.0
+        self._last_yield_request: Optional[Dict[str, Any]] = None
         self._ring_buffer = RingBuffer(
             buffer_size=buffer_size,
             max_frames=max_frames,
@@ -334,6 +350,13 @@ class SerialAdapter:
                     max(0.0, self._idle_probe_suppressed_until_wall) * 1000
                 ),
             },
+            "com_arbitration": {
+                "last_yield_request": (
+                    copy.deepcopy(self._last_yield_request)
+                    if isinstance(self._last_yield_request, dict)
+                    else None
+                ),
+            },
         }
 
     def _persist_diag_state_locked(self) -> None:
@@ -399,6 +422,34 @@ class SerialAdapter:
             suppressed_ms = recovery.get("probe_suppressed_until_ms")
             if isinstance(suppressed_ms, (int, float)) and suppressed_ms > 0:
                 self._idle_probe_suppressed_until_wall = float(suppressed_ms) / 1000.0
+
+            arbitration = payload.get("com_arbitration", {})
+            if isinstance(arbitration, dict):
+                last_request = arbitration.get("last_yield_request")
+                if isinstance(last_request, dict):
+                    requested_by = _normalize_short_text(
+                        last_request.get("requested_by")
+                    )
+                    reason = _normalize_short_text(last_request.get("reason"))
+                    requested_at_ms_raw = last_request.get("requested_at_ms")
+                    requested_at_ms = (
+                        int(requested_at_ms_raw)
+                        if isinstance(requested_at_ms_raw, (int, float))
+                        else int(time.time() * 1000)
+                    )
+                    hold_s_raw = last_request.get("hold_s")
+                    hold_s = (
+                        float(hold_s_raw)
+                        if isinstance(hold_s_raw, (int, float))
+                        and float(hold_s_raw) > 0
+                        else None
+                    )
+                    self._last_yield_request = {
+                        "requested_by": requested_by,
+                        "reason": reason,
+                        "requested_at_ms": requested_at_ms,
+                        "hold_s": hold_s,
+                    }
         except Exception:
             return
 
@@ -676,7 +727,13 @@ class SerialAdapter:
         )
         return True
 
-    def pause_serial(self, hold_s: Optional[float] = None) -> None:
+    def pause_serial(
+        self,
+        hold_s: Optional[float] = None,
+        *,
+        requested_by: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         hold_seconds: Optional[float]
         if hold_s is None:
             hold_seconds = None
@@ -693,6 +750,15 @@ class SerialAdapter:
                 time.monotonic() + hold_seconds if hold_seconds is not None else None
             )
             self._next_reopen_monotonic = 0.0
+            self._last_yield_request = {
+                "requested_by": _normalize_short_text(requested_by, fallback="runtime"),
+                "reason": _normalize_short_text(reason, fallback="manual_pause"),
+                "requested_at_ms": int(time.time() * 1000),
+                "hold_s": hold_seconds,
+            }
+
+        with self._status_lock:
+            self._persist_diag_state_locked()
 
         self._ring_buffer.clear()
         self._close_serial_transport()
@@ -1640,6 +1706,30 @@ class SerialAdapter:
                 "status": self.get_status(),
             }
 
+        if action == ADAPTER_CMD_YIELD:
+            hold_s_raw = command.get("hold_s")
+            hold_s: Optional[float]
+            if isinstance(hold_s_raw, (int, float)):
+                hold_s = float(hold_s_raw)
+            else:
+                hold_s = None
+            requested_by = _normalize_short_text(
+                command.get("requested_by"), fallback="runtime"
+            )
+            reason = _normalize_short_text(
+                command.get("reason"), fallback="com_arbitration_request"
+            )
+            self.pause_serial(hold_s=hold_s, requested_by=requested_by, reason=reason)
+            return {
+                "type": "adapter_runtime_ack",
+                "ok": True,
+                "action": ADAPTER_CMD_YIELD,
+                "requested_by": requested_by,
+                "reason": reason,
+                "hold_s": hold_s if hold_s is not None and hold_s > 0 else None,
+                "status": self.get_status(),
+            }
+
         if action == ADAPTER_CMD_STATUS:
             return {
                 "type": "adapter_runtime_ack",
@@ -1783,6 +1873,7 @@ class SerialAdapter:
             reconnect_attempts = int(self._serial_reconnect_attempts)
             serial_last_error = self._serial_last_error
             pause_until = self._pause_until_monotonic
+            last_yield_request = copy.deepcopy(self._last_yield_request)
         pause_remaining_s: Optional[float]
         if serial_paused and pause_until is not None:
             pause_remaining_s = max(0.0, pause_until - now)
@@ -1806,6 +1897,13 @@ class SerialAdapter:
             probe_last_sent_s_ago = None
         diagnosis_since_s_ago = max(0.0, now_wall - diagnosis_since_wall)
         diagnosis_updated_s_ago = max(0.0, now_wall - diagnosis_updated_wall)
+        com_arbitration_state = "disconnected"
+        if serial_paused:
+            com_arbitration_state = "yielded"
+        elif serial_connected:
+            com_arbitration_state = "active"
+        elif reconnect_attempts > 0:
+            com_arbitration_state = "reclaiming"
         auto_repair_actions: Dict[str, Any] = {}
         all_actions = set(recovery_attempts.keys()) | set(
             RECOVERY_ACTION_MAX_ATTEMPTS.keys()
@@ -1874,6 +1972,15 @@ class SerialAdapter:
                 "remaining_s": lease_remaining_s,
                 "active": lease_owner is not None,
             },
+            "com_arbitration": {
+                "state": com_arbitration_state,
+                "serial_owner": "runtime" if serial_connected else None,
+                "last_yield_request": (
+                    copy.deepcopy(last_yield_request)
+                    if isinstance(last_yield_request, dict)
+                    else None
+                ),
+            },
             "diagnosis": {
                 "code": diagnosis_code,
                 "severity": diagnosis_severity,
@@ -1893,7 +2000,7 @@ class SerialAdapter:
         telemetry_endpoint = self.get_tcp_endpoint()
         control_endpoint = self.get_control_endpoint()
         return {
-            "runtime_protocol_version": "1.0",
+            "runtime_protocol_version": "1.1",
             "transport": {
                 "telemetry": "tcp_jsonl",
                 "control": "tcp_jsonl",
@@ -1956,6 +2063,11 @@ class SerialAdapter:
                 "unsafe_passthrough": bool(self._unsafe_passthrough),
                 "allowlist_enabled": not bool(self._unsafe_passthrough),
                 "allowed_commands": sorted(self._allowed_commands),
+                "com_arbitration": {
+                    "yield_command": ADAPTER_CMD_YIELD,
+                    "status_field": "com_arbitration",
+                    "state_values": ["active", "yielded", "reclaiming", "disconnected"],
+                },
                 "source_arbitration": {
                     "metadata_keys": [
                         CONTROL_META_SOURCE_ID,
@@ -1981,6 +2093,7 @@ class SerialAdapter:
             "runtime_commands": [
                 ADAPTER_CMD_PAUSE,
                 ADAPTER_CMD_RESUME,
+                ADAPTER_CMD_YIELD,
                 ADAPTER_CMD_STATUS,
                 ADAPTER_CMD_CAPABILITIES,
             ],
